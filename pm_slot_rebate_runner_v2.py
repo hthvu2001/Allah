@@ -17,7 +17,13 @@ keeps rows where SLOT REBATE 5% != 0, then for each row, strictly in order:
    9  Competitor Coupon -> Competitor list and Amount become enabled
   10  select DAILY REBATE (5%) - 1
   11  enter the Slot Rebate amount from Excel
-  12  Cancel -> Coupon Redemption closes (TEST_MODE: OK is never clicked)
+  12  OK or Cancel -> Coupon Redemption closes
+
+At start the runner asks whether it may click OK (real redemption). Typing YES
+clicks OK in step 12; any other answer clicks Cancel (test run, as before).
+Players redeemed today (pm_redeemed_ledger.csv) are skipped in OK mode so a
+rerun never redeems the same player twice. Steps are separated by a
+STEP_DELAY_SECONDS pause.
 
 Every step checks the PM state before acting (which popups are open, main
 window enabled or blocked, correct player) and waits for the expected state
@@ -61,7 +67,8 @@ SHEET_NAME = "REBATE"
 PLAYER_ID_COLUMN = "Player ID"
 SLOT_REBATE_COLUMN = "SLOT REBATE 5%"
 COMPETITOR_NAME = "DAILY REBATE (5%) - 1"
-TEST_MODE = True
+STEP_DELAY_SECONDS = 2.0   # pause before every step
+LEDGER_FILE = BASE_DIR / "pm_redeemed_ledger.csv"
 CLOSE_TABS_AT_END = True
 FIND_SHORTCUT = "^f"
 STOP_CODES_ITEM = "Player Stop Codes"
@@ -73,6 +80,7 @@ T_FIND_CLOSE = 5           # 0.02-0.16s
 T_PROFILE_LOAD = 30        # 4.1-5.2s from OK to the new title
 T_PROFILE_POPUPS = 60      # System Messages + paging through all comments
 T_POPUP_CLOSE = 5          # 0.12-0.15s
+T_AFTER_OK = 20            # not recorded yet: OK has never been clicked in a recording
 T_COMMENT_PAGE = 3         # 0.11-0.2s per Next
 T_MENU_OPEN = 3            # 0.15-0.18s
 T_COUPON_OPEN = 5          # 0.21-0.22s
@@ -631,8 +639,9 @@ def control(pm, step, popup, control_id, what, need_enabled=True, timeout=T_VERI
     return found["hwnd"]
 
 
-def click(pm, step, popup, control_id, what):
-    if popup.kind == COUPON and control_id not in COUPON_CLICKABLE_IDS:
+def click(pm, step, popup, control_id, what, allow_coupon_ok=False):
+    allowed = COUPON_CLICKABLE_IDS | ({ID_OK} if allow_coupon_ok else set())
+    if popup.kind == COUPON and control_id not in allowed:
         raise StepError(step, f"Safety stop: refusing to click control id={control_id} in Coupon Redemption.")
     hwnd = control(pm, step, popup, control_id, what)
     log(f"  [{step}] click {what} (id={control_id})")
@@ -853,35 +862,42 @@ def select_competitor(pm, step, coupon, combo_hwnd):
                               f"expected '{COMPETITOR_NAME}'.")
 
 
-def process_player(pm, job, progress):
+def begin_step(progress, name):
+    """Pause STEP_DELAY_SECONDS before every step, then record the step name."""
+    time.sleep(STEP_DELAY_SECONDS)
+    progress["step"] = name
+    return name
+
+
+def process_player(pm, job, progress, allow_ok=False):
     player_id, amount = job["player_id"], job["amount"]
 
-    progress["step"] = step = "1_precheck_idle"
+    step = begin_step(progress, "1_precheck_idle")
     state = check_state(pm, step, popups=(), main_enabled=True)
     if not state.title.startswith("Patron Management - "):
         raise StepError(step, f"PM is not on a logged-in page: '{state.title}'")
     previous_title = state.title
     previous_tab = pm.mdi_active()
 
-    progress["step"] = step = "2_open_find_player"
+    step = begin_step(progress, "2_open_find_player")
     open_find_player(pm, step)
 
-    progress["step"] = step = "3_enter_player_id"
+    step = begin_step(progress, "3_enter_player_id")
     find = check_state(pm, step, popups=(FIND,), main_enabled=False).get(FIND)
     field = control(pm, step, find, FIND_PLAYER_ID_EDIT, "Player ID field")
     set_and_verify(pm, step, field, player_id, "Player ID")
 
-    progress["step"] = step = "4_confirm_find"
+    step = begin_step(progress, "4_confirm_find")
     find = check_state(pm, step, popups=(FIND,), main_enabled=False).get(FIND)
     if pm.text(field).strip() != player_id:
         raise StepError(step, f"Player ID field changed to '{pm.text(field)}' before OK.")
     click(pm, step, find, ID_OK, "Find a Player OK")
     wait_popup_closed(pm, step, find, T_FIND_CLOSE)
 
-    progress["step"] = step = "5_wait_profile_loaded"
+    step = begin_step(progress, "5_wait_profile_loaded")
     wait_profile_title(pm, step, player_id, previous_title, previous_tab)
 
-    progress["step"] = step = "6_profile_popups"
+    step = begin_step(progress, "6_profile_popups")
     messages, pages = settle_profile(pm, step, player_id, QUIET_SECONDS)
     tab = active_profile_tab(pm, step, player_id)
     progress["tab"] = tab
@@ -889,7 +905,7 @@ def process_player(pm, job, progress):
     progress["stop_codes"] = "YES" if STOP_CODES_ITEM in messages else "NO"
     progress["comment_pages"] = pages
 
-    progress["step"] = step = "7_open_options_menu"
+    step = begin_step(progress, "7_open_options_menu")
     check_state(pm, step, popups=(), main_enabled=True, player_id=player_id)
     tab = active_profile_tab(pm, step, player_id)
     options = pm.child(tab, OPTIONS_BUTTON)
@@ -900,7 +916,7 @@ def process_player(pm, job, progress):
     wait_state(pm, step, popups=(MENU,), main_enabled=True, player_id=player_id,
                timeout=T_MENU_OPEN, what="the Options menu")
 
-    progress["step"] = step = "8_click_redeem_coupon"
+    step = begin_step(progress, "8_click_redeem_coupon")
     menu = check_state(pm, step, popups=(MENU,), main_enabled=True, player_id=player_id).get(MENU)
     log(f"  [{step}] click menu item '{REDEEM_MENU_ITEM}'")
     if not pm.click_menu_item(menu.hwnd, REDEEM_MENU_ITEM):
@@ -908,7 +924,7 @@ def process_player(pm, job, progress):
     wait_state(pm, step, popups=(COUPON,), main_enabled=False, player_id=player_id,
                timeout=T_COUPON_OPEN, what="Coupon Redemption")
 
-    progress["step"] = step = "9_select_competitor_coupon"
+    step = begin_step(progress, "9_select_competitor_coupon")
     coupon = check_state(pm, step, popups=(COUPON,), main_enabled=False, player_id=player_id).get(COUPON)
     radio = control(pm, step, coupon, COUPON_COMPETITOR_RADIO, "Competitor Coupon")
     combo = control(pm, step, coupon, COUPON_COMPETITOR_COMBO, "Competitor list", need_enabled=False)
@@ -923,30 +939,41 @@ def process_player(pm, job, progress):
                what="Coupon Redemption only")
     log(f"  [{step}] checkpoint: Competitor Coupon selected, list and Amount enabled")
 
-    progress["step"] = step = "10_select_competitor"
+    step = begin_step(progress, "10_select_competitor")
     check_state(pm, step, popups=(COUPON,), main_enabled=False, player_id=player_id)
     select_competitor(pm, step, coupon, combo)
     wait_state(pm, step, popups=(COUPON,), main_enabled=False, player_id=player_id,
                what="Coupon Redemption only")
     log(f"  [{step}] checkpoint: Competitor = {COMPETITOR_NAME}")
 
-    progress["step"] = step = "11_enter_amount"
+    step = begin_step(progress, "11_enter_amount")
     check_state(pm, step, popups=(COUPON,), main_enabled=False, player_id=player_id)
     set_and_verify(pm, step, amount_field, amount, "Amount", numeric=True)
     wait_state(pm, step, popups=(COUPON,), main_enabled=False, player_id=player_id,
                quiet=0.5, what="no popup after entering the amount")
 
-    progress["step"] = step = "12_cancel_coupon"
+    step = begin_step(progress, "12_ok_coupon" if allow_ok else "12_cancel_coupon")
     check_state(pm, step, popups=(COUPON,), main_enabled=False, player_id=player_id)
     if pm.combo_selected(combo) != COMPETITOR_NAME or \
-            normalized_number_text(pm.text(amount_field)) != normalized_number_text(amount):
-        raise StepError(step, "Coupon fields changed before Cancel.")
-    if not TEST_MODE:
-        raise StepError(step, "TEST_MODE=False is not supported by this build. Nothing was confirmed.")
-    click(pm, step, coupon, ID_CANCEL, "Coupon Redemption Cancel")
-    wait_popup_closed(pm, step, coupon)
+            normalized_number_text(pm.text(amount_field)) != normalized_number_text(amount) or \
+            not pm.checked(radio) or active_profile_tab(pm, step, player_id) != progress["tab"]:
+        raise StepError(step, "Coupon fields or profile changed before the final click. Nothing was clicked.")
+    log(f"  [{step}] final check OK: player {player_id}, {COMPETITOR_NAME}, amount {amount}")
+    if not allow_ok:
+        click(pm, step, coupon, ID_CANCEL, "Coupon Redemption Cancel")
+        wait_popup_closed(pm, step, coupon)
+        wait_state(pm, step, popups=(), main_enabled=True, player_id=player_id,
+                   timeout=T_POPUP_CLOSE, quiet=0.5, what="PM idle after Cancel")
+        return
+    # Written before the click: if anything goes wrong afterwards this player is
+    # still treated as redeemed and is never clicked again by a rerun today.
+    ledger_append(job, "OK_CLICKED")
+    progress["ok_clicked"] = True
+    click(pm, step, coupon, ID_OK, "Coupon Redemption OK", allow_coupon_ok=True)
+    wait_popup_closed(pm, step, coupon, T_AFTER_OK)
     wait_state(pm, step, popups=(), main_enabled=True, player_id=player_id,
-               timeout=T_POPUP_CLOSE, quiet=0.5, what="PM idle after Cancel")
+               timeout=T_AFTER_OK, quiet=1.0, what="PM idle after OK")
+    ledger_append(job, "REDEEMED")
 
 
 def close_profile_tabs(pm, tabs):
@@ -973,6 +1000,42 @@ def close_profile_tabs(pm, tabs):
 
 # ------------------------------------------------------------------ run
 
+LEDGER_FIELDS = ["timestamp", "date", "player_id", "amount", "competitor", "status", "excel_row"]
+
+
+def ledger_players_today():
+    """Player IDs with an OK click recorded today (OK_CLICKED or REDEEMED)."""
+    if not LEDGER_FILE.exists():
+        return set()
+    today = datetime.now().date().isoformat()
+    with LEDGER_FILE.open(newline="", encoding="utf-8-sig") as file:
+        return {row["player_id"] for row in csv.DictReader(file) if row.get("date") == today}
+
+
+def ledger_append(job, status):
+    new_file = not LEDGER_FILE.exists()
+    with LEDGER_FILE.open("a", newline="", encoding="utf-8-sig") as file:
+        writer = csv.DictWriter(file, fieldnames=LEDGER_FIELDS)
+        if new_file:
+            writer.writeheader()
+        now = datetime.now()
+        writer.writerow({"timestamp": now.isoformat(timespec="seconds"), "date": now.date().isoformat(),
+                         "player_id": job["player_id"], "amount": job["amount"],
+                         "competitor": COMPETITOR_NAME, "status": status, "excel_row": job["excel_row"]})
+
+
+def ask_allow_ok(jobs):
+    total = sum(float(job["amount"]) for job in jobs)
+    print("\n" + "=" * 70)
+    print(f"{len(jobs)} player(s), total SLOT REBATE 5% = {normalized_number_text(total)}")
+    for job in jobs:
+        print(f"   row {job['excel_row']:>4}  player {job['player_id']:>8}  amount {job['amount']}")
+    print("=" * 70)
+    answer = input("Allow clicking OK in Coupon Redemption (REAL redemption)?\n"
+                   "Type YES to click OK, anything else = Cancel only (test run): ")
+    return answer.strip() == "YES"
+
+
 CSV_FIELDS = [
     "timestamp", "excel_row", "player_id", "slot_rebate_5_percent", "test_mode", "status",
     "failed_step", "message", "stop_codes", "system_messages", "comment_pages", "duration_s",
@@ -986,8 +1049,10 @@ def write_log(rows):
         writer.writerows(rows)
 
 
-def run(pm, jobs, username, password):
+def run(pm, jobs, username, password, allow_ok=False):
     """Process every job in order; stop at the first error and leave PM untouched."""
+    log(f"Mode: {'OK - REAL REDEMPTION' if allow_ok else 'Cancel only (test run)'}")
+    done_today = ledger_players_today() if allow_ok else set()
     results = []
     tabs = []
     progress = {"step": "0_login"}
@@ -1006,16 +1071,27 @@ def run(pm, jobs, username, password):
             "excel_row": job["excel_row"],
             "player_id": job["player_id"],
             "slot_rebate_5_percent": job["amount"],
-            "test_mode": TEST_MODE,
+            "test_mode": not allow_ok,
             "status": "", "failed_step": "", "message": "",
             "stop_codes": "", "system_messages": "", "comment_pages": "", "duration_s": "",
         }
         log(f"[{index}/{len(jobs)}] Player ID {job['player_id']}, Amount {job['amount']} "
             f"(Excel row {job['excel_row']})")
+        if job["player_id"] in done_today:
+            record.update({"status": "SKIPPED_ALREADY_REDEEMED", "duration_s": 0,
+                           "message": f"OK was already clicked today (see {LEDGER_FILE.name})."})
+            results.append(record)
+            write_log(results)
+            log(f"Player {job['player_id']}: skipped, already redeemed today")
+            continue
         try:
-            process_player(pm, job, progress)
-            record["status"] = "TEST_CANCELLED"
-            record["message"] = "Amount entered from Excel; Coupon Redemption cancelled."
+            process_player(pm, job, progress, allow_ok)
+            if allow_ok:
+                record["status"] = "REDEEMED"
+                record["message"] = "Amount entered from Excel; Coupon Redemption confirmed with OK."
+            else:
+                record["status"] = "TEST_CANCELLED"
+                record["message"] = "Amount entered from Excel; Coupon Redemption cancelled."
         except Exception as exc:
             failed_step = getattr(exc, "step", progress["step"])
             try:
@@ -1023,7 +1099,7 @@ def run(pm, jobs, username, password):
             except Exception:
                 screen = "unavailable"
             record.update({
-                "status": "ERROR",
+                "status": "ERROR_AFTER_OK" if progress.get("ok_clicked") else "ERROR",
                 "failed_step": failed_step,
                 "message": f"{type(exc).__name__}: {exc} | screen: {screen}",
             })
@@ -1035,12 +1111,12 @@ def run(pm, jobs, username, password):
         write_log(results)
         if progress.get("tab"):
             tabs.append((progress["tab"], job["player_id"]))
-        if record["status"] == "ERROR":
+        if record["status"].startswith("ERROR"):
             log(f"Player {job['player_id']}: ERROR at {record['failed_step']}: {record['message']}")
             log("STOPPED. PM is left exactly as it is for inspection; no cleanup was done.")
             log(f"Log file: {LOG_FILE}")
             return 1
-        log(f"Player {job['player_id']}: TEST_CANCELLED in {record['duration_s']}s")
+        log(f"Player {job['player_id']}: {record['status']} in {record['duration_s']}s")
 
     if CLOSE_TABS_AT_END:
         try:
@@ -1048,14 +1124,15 @@ def run(pm, jobs, username, password):
         except Exception as exc:
             log(f"STOPPED while closing tabs at {getattr(exc, 'step', 'close_tabs')}: {exc}")
             return 1
-    log(f"Done. Test-cancelled: {len(results)} of {len(jobs)}")
+    counts = {}
+    for row in results:
+        counts[row["status"]] = counts.get(row["status"], 0) + 1
+    log(f"Done. {counts}")
     log(f"Log file: {LOG_FILE}")
     return 0
 
 
 def main():
-    if not TEST_MODE:
-        raise SystemExit("Safety stop: this build requires TEST_MODE=True.")
     try:
         from pm_credentials import PM_USERNAME, PM_PASSWORD
     except ImportError as exc:
@@ -1068,9 +1145,10 @@ def main():
         write_log([])
         return 0
     log(f"Loaded {len(jobs)} Slot Rebate job(s) from Excel: " + ", ".join(x["player_id"] for x in jobs))
+    allow_ok = ask_allow_ok(jobs)
     pm = Win32PM()
     pm.connect()
-    return run(pm, jobs, PM_USERNAME, PM_PASSWORD)
+    return run(pm, jobs, PM_USERNAME, PM_PASSWORD, allow_ok)
 
 
 if __name__ == "__main__":
