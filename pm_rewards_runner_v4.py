@@ -59,7 +59,7 @@ try:
 except ImportError:  # lets the step logic be imported and tested off Windows
     win32con = win32gui = win32process = None
 
-RUNNER_VERSION = "4.1-four-workflows"
+RUNNER_VERSION = "4.2-four-workflows"
 BASE_DIR = Path(__file__).resolve().parent
 EXCEL_FILE = BASE_DIR / "Excel-for-auto.xlsx"
 LOG_FILE = BASE_DIR / "pm_automation_log.csv"
@@ -90,7 +90,8 @@ WORKFLOWS = {
                   "reason": "P) COSMO ELITE CIRCUIT", "comment": lambda today: "COSMO ELITE CIRCUIT"},
 }
 WORKFLOW_ORDER = ["REBATE_SLOT", "REBATE_BBR", "COSMO_SLOT", "COSMO_BBR"]
-STEP_DELAY_SECONDS = 2.0   # pause before every step
+STEP_DELAY_SECONDS = 1.0   # pause before every step (checks before/after a step are not shortened)
+ACTION_PAUSE_SECONDS = 0.1   # after sending a click
 CONTROL_MODE = "background"   # "background": messages + UIA only; "mouse": physical clicks (v2)
 # Optional WM_COMMAND ids. When set, the command is posted to the PM main window
 # instead of using the Ribbon button / the Options menu.
@@ -746,7 +747,7 @@ class Win32PM:
         if not background_mode():
             self.focus(self._top(hwnd))
             HwndWrapper(hwnd).click_input()
-            time.sleep(0.2)
+            time.sleep(ACTION_PAUSE_SECONDS)
             return
         cls = win32gui.GetClassName(hwnd).casefold()
         if "button" not in cls:
@@ -763,7 +764,7 @@ class Win32PM:
         control_id = win32gui.GetDlgCtrlID(hwnd) & 0xFFFF
         win32gui.PostMessage(win32gui.GetParent(hwnd), win32con.WM_COMMAND,
                              (BN_CLICKED << 16) | control_id, hwnd)
-        time.sleep(0.2)
+        time.sleep(ACTION_PAUSE_SECONDS)
 
     def set_text(self, hwnd, value):
         HwndWrapper(hwnd).set_edit_text(str(value))    # EM_SETSEL + EM_REPLACESEL, no focus
@@ -1178,7 +1179,13 @@ def wait_popup_closed(pm, step, popup, timeout=T_POPUP_CLOSE):
     log(f"  [{step}] {popup.kind} closed")
 
 
-def control(pm, step, popup, control_id, what, need_enabled=True, timeout=T_VERIFY):
+def caption(pm, hwnd):
+    """Button text without the & of the keyboard mnemonic ("&Close" -> "Close")."""
+    return pm.text(hwnd).replace("&", "").strip()
+
+
+def control(pm, step, popup, control_id, what, need_enabled=True, timeout=T_VERIFY, expect=None):
+    """Find a control by its ID in a popup; with `expect`, its caption must match too."""
     found = {}
 
     def ready():
@@ -1189,15 +1196,18 @@ def control(pm, step, popup, control_id, what, need_enabled=True, timeout=T_VERI
     if not wait_until(ready, timeout):
         state = "missing" if not found.get("hwnd") else "disabled"
         raise StepError(step, f"{what} (id={control_id}) in {popup.label()} is {state}.")
+    if expect is not None and caption(pm, found["hwnd"]).casefold() != expect.casefold():
+        raise StepError(step, f"control id={control_id} in {popup.label()} reads '{caption(pm, found['hwnd'])}', "
+                              f"expected '{expect}'. Nothing was clicked.")
     return found["hwnd"]
 
 
-def click(pm, step, popup, control_id, what, allow_ok=False):
+def click(pm, step, popup, control_id, what, allow_ok=False, expect=None):
     allowed = {COUPON: COUPON_CLICKABLE_IDS, ADJUST: ADJUST_CLICKABLE_IDS}.get(popup.kind)
     if allowed is not None and control_id not in allowed | ({ID_OK} if allow_ok else set()):
         raise StepError(step, f"Safety stop: refusing to click control id={control_id} in {popup.title}.")
-    hwnd = control(pm, step, popup, control_id, what)
-    log(f"  [{step}] click {what} (id={control_id})")
+    hwnd = control(pm, step, popup, control_id, what, expect=expect)
+    log(f"  [{step}] click {what} (id={control_id}" + (f", '{expect}'" if expect else "") + ")")
     pm.click(hwnd)
     return hwnd
 
@@ -1344,7 +1354,7 @@ def handle_system_messages(pm, step, popup):
     items = pm.list_items_levels(popup.hwnd)
     lines, titles = summarize_messages(items)
     log(f"  [{step}] System Messages: {' | '.join(lines) or '(no readable items)'} (logged only)")
-    click(pm, step, popup, SYSMSG_CLOSE, "System Messages Close")
+    click(pm, step, popup, SYSMSG_CLOSE, "System Messages Close", expect="Close")
     wait_popup_closed(pm, step, popup)
     return lines, titles
 
@@ -1358,13 +1368,14 @@ def comment_signature(pm, popup, next_hwnd, close_hwnd):
 
 def handle_player_comment(pm, step, popup):
     """Close is disabled until the last comment has been shown: page with Next first."""
-    next_hwnd = control(pm, step, popup, COMMENT_NEXT, "Player Comment Next", need_enabled=False)
-    close_hwnd = control(pm, step, popup, COMMENT_CLOSE, "Player Comment Close", need_enabled=False)
+    next_hwnd = control(pm, step, popup, COMMENT_NEXT, "Player Comment Next", need_enabled=False, expect="Next")
+    close_hwnd = control(pm, step, popup, COMMENT_CLOSE, "Player Comment Close", need_enabled=False,
+                         expect="Close")
     page = 1
     while True:
         if pm.enabled(close_hwnd):
             log(f"  [{step}] Player Comment: all {page} page(s) shown, Close is enabled")
-            click(pm, step, popup, COMMENT_CLOSE, "Player Comment Close")
+            click(pm, step, popup, COMMENT_CLOSE, "Player Comment Close", expect="Close")
             wait_popup_closed(pm, step, popup)
             return page
         if page >= MAX_COMMENT_PAGES:
@@ -1525,7 +1536,7 @@ def open_profile(pm, job, progress):
     find = check_state(pm, step, popups=(FIND,), main_enabled=False).get(FIND)
     if pm.text(field).strip() != player_id:
         raise StepError(step, f"Player ID field changed to '{pm.text(field)}' before OK.")
-    click(pm, step, find, ID_OK, "Find a Player OK")
+    click(pm, step, find, ID_OK, "Find a Player OK", expect="OK")
     wait_popup_closed(pm, step, find, T_FIND_CLOSE)
 
     step = begin_step(progress, "5_wait_profile_loaded")
@@ -1558,7 +1569,7 @@ def finish_dialog(pm, step, job, progress, dialog, allow_ok):
     """OK (real, recorded in the ledger first) or Cancel (test), then PM must be idle again."""
     player_id = job["player_id"]
     if not allow_ok:
-        click(pm, step, dialog, ID_CANCEL, f"{dialog.title} Cancel")
+        click(pm, step, dialog, ID_CANCEL, f"{dialog.title} Cancel", expect="Cancel")
         wait_popup_closed(pm, step, dialog)
         wait_state(pm, step, popups=(), main_enabled=True, player_id=player_id,
                    timeout=T_POPUP_CLOSE, quiet=0.5, what="PM idle after Cancel")
@@ -1567,7 +1578,7 @@ def finish_dialog(pm, step, job, progress, dialog, allow_ok):
     # still treated as done and is never clicked again by a rerun today.
     ledger_append(job, "OK_CLICKED")
     progress["ok_clicked"] = True
-    click(pm, step, dialog, ID_OK, f"{dialog.title} OK", allow_ok=True)
+    click(pm, step, dialog, ID_OK, f"{dialog.title} OK", allow_ok=True, expect="OK")
     wait_popup_closed(pm, step, dialog, T_AFTER_OK)
     wait_state(pm, step, popups=(), main_enabled=True, player_id=player_id,
                timeout=T_AFTER_OK, quiet=1.0, what="PM idle after OK")
@@ -1609,12 +1620,12 @@ def run_coupon(pm, job, progress, allow_ok):
 
     step = begin_step(progress, "9_select_competitor_coupon")
     coupon = check_state(pm, step, popups=(COUPON,), main_enabled=False, player_id=player_id).get(COUPON)
-    radio = control(pm, step, coupon, COUPON_COMPETITOR_RADIO, "Competitor Coupon")
-    our_radio = control(pm, step, coupon, COUPON_OUR_RADIO, "Our Coupon", need_enabled=False)
+    radio = control(pm, step, coupon, COUPON_COMPETITOR_RADIO, "Competitor Coupon", expect="Competitor Coupon")
+    our_radio = control(pm, step, coupon, COUPON_OUR_RADIO, "Our Coupon", need_enabled=False, expect="Our Coupon")
     combo = control(pm, step, coupon, COUPON_COMPETITOR_COMBO, "Competitor list", need_enabled=False)
     amount_field = control(pm, step, coupon, COUPON_AMOUNT_EDIT, "Amount", need_enabled=False)
     log(f"  [{step}] initial: Competitor list enabled={pm.enabled(combo)}, Amount enabled={pm.enabled(amount_field)}")
-    click(pm, step, coupon, COUPON_COMPETITOR_RADIO, "Competitor Coupon")
+    click(pm, step, coupon, COUPON_COMPETITOR_RADIO, "Competitor Coupon", expect="Competitor Coupon")
     if not wait_until(lambda: pm.checked(radio) and not pm.checked(our_radio)
                       and pm.enabled(combo) and pm.enabled(amount_field), T_FIELDS_ENABLE):
         raise StepError(step, f"after Competitor Coupon: selected={pm.checked(radio)}, "
@@ -1690,11 +1701,11 @@ def run_bbr(pm, job, progress, allow_ok):
 
     step = begin_step(progress, "9_add_bbr")
     check_state(pm, step, popups=(ADJUST,), main_enabled=False, player_id=player_id)
-    add = control(pm, step, dialog, ADJ_ADD_RADIO, "Add BBR")
+    add = control(pm, step, dialog, ADJ_ADD_RADIO, "Add BBR", expect="Add BBR")
     others = [control(pm, step, dialog, cid, name, need_enabled=False)
               for cid, name in ((ADJ_SUBTRACT_RADIO, "Subtract BBR"), (ADJ_ZERO_RADIO, "Set BBR to 0"))]
     if not pm.checked(add):
-        click(pm, step, dialog, ADJ_ADD_RADIO, "Add BBR")
+        click(pm, step, dialog, ADJ_ADD_RADIO, "Add BBR", expect="Add BBR")
     if not wait_until(lambda: pm.checked(add) and not any(pm.checked(h) for h in others), T_VERIFY):
         raise StepError(step, "Add BBR is not the only selected option.")
     log(f"  [{step}] checkpoint: Add BBR selected")
