@@ -23,7 +23,11 @@ and noted.
 Every job: pre-check idle PM, Find a Player (Ribbon / command), enter the ID,
 OK, wait for the profile, handle System Messages / Player Comment, check the
 Identification name (skip "(Loc:"), then the workflow steps, each with a check
-before and after. At start the runner asks whether it may click OK (YES = real
+before and after. When the check after an action finds it not done (e.g. System
+Messages still open after Close), the action is repeated: at most MAX_ATTEMPTS
+(3) tries in total, only while PM still shows the same screen; then the run
+stops. The final OK is clicked exactly once and never repeated.
+At start the runner asks whether it may click OK (YES = real
 redemption / adjustment, anything else = Cancel test run). OK clicks are
 written to pm_redeemed_ledger.csv per player and workflow, and a rerun on the
 same day skips them. The first error stops the run and leaves PM as it is.
@@ -59,7 +63,7 @@ try:
 except ImportError:  # lets the step logic be imported and tested off Windows
     win32con = win32gui = win32process = None
 
-RUNNER_VERSION = "4.2-four-workflows"
+RUNNER_VERSION = "4.3-four-workflows"
 BASE_DIR = Path(__file__).resolve().parent
 EXCEL_FILE = BASE_DIR / "Excel-for-auto.xlsx"
 LOG_FILE = BASE_DIR / "pm_automation_log.csv"
@@ -92,6 +96,8 @@ WORKFLOWS = {
 WORKFLOW_ORDER = ["REBATE_SLOT", "REBATE_BBR", "COSMO_SLOT", "COSMO_BBR"]
 STEP_DELAY_SECONDS = 1.0   # pause before every step (checks before/after a step are not shortened)
 ACTION_PAUSE_SECONDS = 0.1   # after sending a click
+MAX_ATTEMPTS = 3             # tries of one action in total when its result is missing (never the final OK)
+RETRY_PAUSE_SECONDS = 1.0    # between two tries
 CONTROL_MODE = "background"   # "background": messages + UIA only; "mouse": physical clicks (v2)
 # Optional WM_COMMAND ids. When set, the command is posted to the PM main window
 # instead of using the Ribbon button / the Options menu.
@@ -1168,6 +1174,83 @@ def wait_until(predicate, timeout, interval=POLL):
         time.sleep(interval)
 
 
+def state_if(pm, popups=(), main_enabled=None, player_id=None):
+    """The current state when it matches, else None."""
+    state = read_state(pm)
+    return state if state_problem(state, popups, main_enabled, player_id) is None else None
+
+
+def screen_is(popups=(), main_enabled=None):
+    """Predicate on a state: exactly these popups (and main window enabled/blocked)."""
+    def check(state):
+        return state.kinds() == sorted(popups) and (main_enabled is None or state.main_enabled == main_enabled)
+    return check
+
+
+def attempt_until(pm, step, what, action, done, timeout, same_screen=None, describe=None):
+    """Do `action`, then wait up to `timeout` for `done()`; repeat it while the result is missing.
+
+    At most MAX_ATTEMPTS tries in total. Before a new try PM must still show the screen the
+    action was made for (`same_screen(state)`); any other screen or an unknown popup stops the run.
+    """
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        if attempt > 1:
+            time.sleep(RETRY_PAUSE_SECONDS)
+            state = read_state(pm)
+            raise_on_unknown(pm, step, state, what)
+            result = _safe_done(done)
+            if result:
+                log(f"  [{step}] {what}: done (late, no new try needed)")
+                return result
+            if same_screen is not None and not same_screen(state):
+                raise StepError(step, f"{what}: not done and PM shows another screen, so it is not repeated"
+                                      f"{_details(describe)}. State: {state.summary()}")
+            log(f"  [{step}] {what}: not done yet, trying again (try {attempt}/{MAX_ATTEMPTS})")
+        action(attempt)
+        deadline = time.time() + timeout
+        while True:
+            state = read_state(pm)
+            raise_on_unknown(pm, step, state, what)
+            result = _safe_done(done)
+            if result:
+                if attempt > 1:
+                    log(f"  [{step}] {what}: done on try {attempt}")
+                return result
+            if time.time() > deadline:
+                break
+            time.sleep(POLL)
+    raise StepError(step, f"{what}: still not done after {MAX_ATTEMPTS} tries"
+                          f"{_details(describe)}. State: {read_state(pm).summary()}")
+
+
+def _details(describe):
+    if describe is None:
+        return ""
+    try:
+        return f" ({describe()})"
+    except Exception as exc:
+        return f" (details not readable: {exc})"
+
+
+def _safe_done(done):
+    """done() with read errors (e.g. a control being destroyed) counted as 'not yet'."""
+    try:
+        return done()
+    except StepError:
+        raise
+    except Exception:
+        return None
+
+
+def close_popup(pm, step, popup, control_id, what, expect, timeout=None):
+    """Click a closing button (Close / Cancel) and retry until the popup is gone."""
+    attempt_until(pm, step, what,
+                  lambda attempt: click(pm, step, popup, control_id, what, expect=expect),
+                  lambda: not pm.visible(popup.hwnd), timeout or T_POPUP_CLOSE,
+                  same_screen=lambda state: any(p.hwnd == popup.hwnd for p in state.popups))
+    log(f"  [{step}] {popup.kind} closed")
+
+
 def wait_popup_closed(pm, step, popup, timeout=T_POPUP_CLOSE):
     deadline = time.time() + timeout
     while pm.visible(popup.hwnd):
@@ -1212,25 +1295,23 @@ def click(pm, step, popup, control_id, what, allow_ok=False, expect=None):
     return hwnd
 
 
-def set_and_verify(pm, step, hwnd, value, what, numeric=False):
+def set_and_verify(pm, step, hwnd, value, what, numeric=False, screen=None):
+    """Write a field and read it back; rewrite it (at most MAX_ATTEMPTS tries) until it shows the value."""
     norm = normalized_number_text if numeric else (lambda v: str(v).strip())
     expected = norm(value)
 
-    def matches():
-        return norm(pm.text(hwnd)) == expected
+    def action(attempt):
+        if attempt == MAX_ATTEMPTS and not background_mode():
+            log(f"  [{step}] {what}: typing instead")
+            pm.type_text(hwnd, value)
+        else:
+            pm.set_text(hwnd, value)
 
-    pm.set_text(hwnd, value)
-    if not wait_until(matches, 1.5):
-        if background_mode():
-            raise StepError(step, f"{what} shows '{pm.text(hwnd)}', expected '{expected}'.")
-        log(f"  [{step}] {what}: direct set did not stick, typing instead")
-        pm.type_text(hwnd, value)
-        if not wait_until(matches, T_VERIFY):
-            raise StepError(step, f"{what} shows '{pm.text(hwnd)}', expected '{expected}'.")
+    attempt_until(pm, step, f"{what} = {expected}", action, lambda: norm(pm.text(hwnd)) == expected, T_VERIFY,
+                  same_screen=screen_is(screen) if screen is not None else None,
+                  describe=lambda: f"field shows '{pm.text(hwnd)}'")
     log(f"  [{step}] checkpoint: {what} = {expected}")
 
-
-# ----------------------------------------------------------------- steps
 
 def ensure_logged_in(pm, username, password):
     step = "0_login"
@@ -1264,40 +1345,28 @@ def ensure_logged_in(pm, username, password):
 
 def open_find_player(pm, step):
     check_state(pm, step, popups=(), main_enabled=True)
-    clicked = False
-    command = getattr(pm, "find_command", None) if background_mode() else None
-    try:
+
+    def action(attempt):
+        command = getattr(pm, "find_command", None) if background_mode() else None
+        if attempt == MAX_ATTEMPTS and command:
+            log(f"  [{step}] the Ctrl+F command {command} did not open Find a Player; using the Ribbon button")
+            pm.find_command = command = None
+        if attempt == MAX_ATTEMPTS and not background_mode():
+            log(f"  [{step}] shortcut {FIND_SHORTCUT}")
+            pm.send_find_shortcut()
+            return
         log(f"  [{step}] " + (f"send the Ctrl+F command (id {command})" if command
                               else f"click Ribbon '{FIND_RIBBON_BUTTON}'"))
-        clicked = pm.click_ribbon_find()
-    except Exception as exc:
-        log(f"  [{step}] opening Find a Player failed: {exc}")
-    if clicked and command:
-        state = wait_state(pm, step, popups=(FIND,), main_enabled=False, timeout=T_FIND_OPEN,
-                           what="Find a Player", fail=False)
-        if state:
-            return state
-        if not read_state(pm).popups and read_state(pm).main_enabled:
-            log(f"  [{step}] command {command} did not open Find a Player; using the Ribbon button")
-            pm.find_command = None
-            clicked = pm.click_ribbon_find()
-    if clicked:
-        state = wait_state(pm, step, popups=(FIND,), main_enabled=False, timeout=T_FIND_OPEN,
-                           what="Find a Player", fail=False)
-        if state:
-            return state
-    state = read_state(pm)
-    if state.popups or not state.main_enabled:
-        # Something is already opening; do not send a second command.
-        return wait_state(pm, step, popups=(FIND,), main_enabled=False, timeout=T_FIND_OPEN,
-                          what="Find a Player")
-    if background_mode():
-        raise StepError(step, "Find a Player did not open from the Ribbon button (background mode). "
-                              "Set FIND_PLAYER_COMMAND_ID or use CONTROL_MODE = 'mouse'.")
-    log(f"  [{step}] fallback: shortcut {FIND_SHORTCUT}")
-    pm.send_find_shortcut()
-    return wait_state(pm, step, popups=(FIND,), main_enabled=False, timeout=T_FIND_OPEN,
-                      what="Find a Player")
+        try:
+            pm.click_ribbon_find()
+        except Exception as exc:
+            log(f"  [{step}] opening Find a Player failed: {exc}")
+
+    state = attempt_until(pm, step, "open Find a Player", action,
+                          lambda: state_if(pm, popups=(FIND,), main_enabled=False), T_FIND_OPEN,
+                          same_screen=screen_is((), main_enabled=True))
+    log(f"  [{step}] post-check OK  {state.summary()}")
+    return state
 
 
 def wait_profile_title(pm, step, player_id, previous_title, previous_tab):
@@ -1354,8 +1423,7 @@ def handle_system_messages(pm, step, popup):
     items = pm.list_items_levels(popup.hwnd)
     lines, titles = summarize_messages(items)
     log(f"  [{step}] System Messages: {' | '.join(lines) or '(no readable items)'} (logged only)")
-    click(pm, step, popup, SYSMSG_CLOSE, "System Messages Close", expect="Close")
-    wait_popup_closed(pm, step, popup)
+    close_popup(pm, step, popup, SYSMSG_CLOSE, "System Messages Close", expect="Close")
     return lines, titles
 
 
@@ -1375,21 +1443,20 @@ def handle_player_comment(pm, step, popup):
     while True:
         if pm.enabled(close_hwnd):
             log(f"  [{step}] Player Comment: all {page} page(s) shown, Close is enabled")
-            click(pm, step, popup, COMMENT_CLOSE, "Player Comment Close", expect="Close")
-            wait_popup_closed(pm, step, popup)
+            close_popup(pm, step, popup, COMMENT_CLOSE, "Player Comment Close", expect="Close")
             return page
         if page >= MAX_COMMENT_PAGES:
             raise StepError(step, f"Player Comment still not closable after {page} pages.")
         if pm.enabled(next_hwnd):
             before = comment_signature(pm, popup, next_hwnd, close_hwnd)
-            for attempt in (1, 2):
+
+            def press_next(attempt, page=page):
                 log(f"  [{step}] Player Comment: click Next (page {page} -> {page + 1})")
                 pm.click(next_hwnd)
-                if wait_until(lambda: comment_signature(pm, popup, next_hwnd, close_hwnd) != before,
-                              T_COMMENT_PAGE):
-                    break
-                if attempt == 2:
-                    raise StepError(step, "Player Comment did not react to Next.")
+
+            attempt_until(pm, step, "Player Comment Next", press_next,
+                          lambda: comment_signature(pm, popup, next_hwnd, close_hwnd) != before, T_COMMENT_PAGE,
+                          same_screen=lambda state: any(p.hwnd == popup.hwnd for p in state.popups))
             page += 1
             continue
         # Next can be hidden for ~0.1s while PM redraws it.
@@ -1462,28 +1529,30 @@ def active_profile_tab(pm, step, player_id):
     return tab
 
 
-def select_combo(pm, step, combo_hwnd, value, what):
+def select_combo(pm, step, combo_hwnd, value, what, screen):
+    """Select an exact item; reselect (at most MAX_ATTEMPTS tries) until the list shows it."""
     items = pm.combo_items(combo_hwnd)
     if value not in items:
         raise StepError(step, f"'{value}' is not in the {what} list ({len(items)} items).")
-    log(f"  [{step}] select '{value}' in {what}")
-    try:
-        pm.combo_select(combo_hwnd, value)
-    except Exception as exc:
-        log(f"  [{step}] direct select failed: {exc}")
-    if wait_until(lambda: pm.combo_selected(combo_hwnd) == value, T_VERIFY):
-        return
-    if background_mode():
-        raise StepError(step, f"{what} shows '{pm.combo_selected(combo_hwnd)}', expected '{value}'.")
-    log(f"  [{step}] fallback: open the list and click the item")
-    popup_kind = read_state(pm).popups[0].kind
-    pm.click(combo_hwnd)
-    state = wait_state(pm, step, popups=(popup_kind, DROPDOWN), timeout=T_VERIFY, what=f"the {what} list")
-    if not pm.click_named_item(state.get(DROPDOWN).hwnd, value, "ListItem"):
-        raise StepError(step, f"'{value}' not found in the open {what} list.")
-    wait_state(pm, step, popups=(popup_kind,), timeout=T_VERIFY, what=f"the {what} list to close")
-    if not wait_until(lambda: pm.combo_selected(combo_hwnd) == value, T_VERIFY):
-        raise StepError(step, f"{what} shows '{pm.combo_selected(combo_hwnd)}', expected '{value}'.")
+
+    def action(attempt):
+        if attempt == MAX_ATTEMPTS and not background_mode():
+            log(f"  [{step}] open the {what} list and click '{value}'")
+            pm.click(combo_hwnd)
+            state = wait_state(pm, step, popups=tuple(screen) + (DROPDOWN,), timeout=T_VERIFY,
+                               what=f"the {what} list")
+            if not pm.click_named_item(state.get(DROPDOWN).hwnd, value, "ListItem"):
+                raise StepError(step, f"'{value}' not found in the open {what} list.")
+            return
+        log(f"  [{step}] select '{value}' in {what}")
+        try:
+            pm.combo_select(combo_hwnd, value)
+        except Exception as exc:
+            log(f"  [{step}] direct select failed: {exc}")
+
+    attempt_until(pm, step, f"{what} = {value}", action, lambda: pm.combo_selected(combo_hwnd) == value,
+                  T_VERIFY, same_screen=lambda state: state.kinds() in (sorted(screen), sorted(tuple(screen) + (DROPDOWN,))),
+                  describe=lambda: f"list shows '{pm.combo_selected(combo_hwnd)}'")
 
 
 def money(text):
@@ -1516,9 +1585,7 @@ def open_profile(pm, job, progress):
     if open_tab and title_has_player(pm.window_title(open_tab), player_id):
         # Same player as the previous job: close its tab so Find opens a fresh profile.
         log(f"  [{step}] profile of {player_id} is still open, closing that tab first")
-        pm.close_tab(open_tab)
-        if not wait_until(lambda: not pm.exists(open_tab) or not pm.visible(open_tab), T_TAB_CLOSE):
-            raise StepError(step, f"tab of {player_id} did not close. State: {read_state(pm).summary()}")
+        close_tab_until_gone(pm, step, open_tab, f"close the tab of {player_id}")
         state = wait_state(pm, step, popups=(), main_enabled=True, timeout=T_TAB_CLOSE, quiet=0.5,
                            what="PM idle after closing the tab")
     previous_title = state.title
@@ -1530,14 +1597,17 @@ def open_profile(pm, job, progress):
     step = begin_step(progress, "3_enter_player_id")
     find = check_state(pm, step, popups=(FIND,), main_enabled=False).get(FIND)
     field = control(pm, step, find, FIND_PLAYER_ID_EDIT, "Player ID field")
-    set_and_verify(pm, step, field, player_id, "Player ID")
+    set_and_verify(pm, step, field, player_id, "Player ID", screen=(FIND,))
 
     step = begin_step(progress, "4_confirm_find")
     find = check_state(pm, step, popups=(FIND,), main_enabled=False).get(FIND)
     if pm.text(field).strip() != player_id:
         raise StepError(step, f"Player ID field changed to '{pm.text(field)}' before OK.")
-    click(pm, step, find, ID_OK, "Find a Player OK", expect="OK")
-    wait_popup_closed(pm, step, find, T_FIND_CLOSE)
+    attempt_until(pm, step, "Find a Player OK",
+                  lambda attempt: click(pm, step, find, ID_OK, "Find a Player OK", expect="OK"),
+                  lambda: not pm.visible(find.hwnd), T_FIND_CLOSE,
+                  same_screen=lambda state: state.get(FIND) is not None and pm.text(field).strip() == player_id)
+    log(f"  [{step}] FIND closed")
 
     step = begin_step(progress, "5_wait_profile_loaded")
     wait_profile_title(pm, step, player_id, previous_title, previous_tab)
@@ -1569,8 +1639,7 @@ def finish_dialog(pm, step, job, progress, dialog, allow_ok):
     """OK (real, recorded in the ledger first) or Cancel (test), then PM must be idle again."""
     player_id = job["player_id"]
     if not allow_ok:
-        click(pm, step, dialog, ID_CANCEL, f"{dialog.title} Cancel", expect="Cancel")
-        wait_popup_closed(pm, step, dialog)
+        close_popup(pm, step, dialog, ID_CANCEL, f"{dialog.title} Cancel", expect="Cancel")
         wait_state(pm, step, popups=(), main_enabled=True, player_id=player_id,
                    timeout=T_POPUP_CLOSE, quiet=0.5, what="PM idle after Cancel")
         return
@@ -1578,6 +1647,7 @@ def finish_dialog(pm, step, job, progress, dialog, allow_ok):
     # still treated as done and is never clicked again by a rerun today.
     ledger_append(job, "OK_CLICKED")
     progress["ok_clicked"] = True
+    # Clicked exactly once: a slow PM must never get a second OK (no double redemption).
     click(pm, step, dialog, ID_OK, f"{dialog.title} OK", allow_ok=True, expect="OK")
     wait_popup_closed(pm, step, dialog, T_AFTER_OK)
     wait_state(pm, step, popups=(), main_enabled=True, player_id=player_id,
@@ -1593,30 +1663,52 @@ def run_coupon(pm, job, progress, allow_ok):
     step = begin_step(progress, "7_open_options_menu")
     check_state(pm, step, popups=(), main_enabled=True, player_id=player_id)
     tab = active_profile_tab(pm, step, player_id)
+    options = None
     if REDEEM_COUPON_COMMAND_ID:
         log(f"  [{step}] skipped: Redeem Coupon is sent as command id {REDEEM_COUPON_COMMAND_ID}")
     else:
         options = pm.child(tab, OPTIONS_BUTTON)
-        if not options or not pm.enabled(options):
-            raise StepError(step, "Options... button not found or disabled on the active profile tab.")
-        log(f"  [{step}] click Options... (id={OPTIONS_BUTTON})")
-        pm.click(options)
-        wait_state(pm, step, popups=(MENU,), main_enabled=True, player_id=player_id,
-                   timeout=T_MENU_OPEN, what="the Options menu")
+        if not options or not pm.enabled(options) or caption(pm, options) != "Options...":
+            raise StepError(step, "Options... button not found, disabled or renamed on the active profile tab.")
+
+        def open_menu(attempt):
+            log(f"  [{step}] click Options... (id={OPTIONS_BUTTON})")
+            pm.click(options)
+
+        attempt_until(pm, step, "open the Options menu", open_menu,
+                      lambda: state_if(pm, popups=(MENU,), main_enabled=True, player_id=player_id), T_MENU_OPEN,
+                      same_screen=screen_is((), main_enabled=True))
+        log(f"  [{step}] post-check OK  Options menu is open")
 
     step = begin_step(progress, "8_click_redeem_coupon")
     if REDEEM_COUPON_COMMAND_ID:
         check_state(pm, step, popups=(), main_enabled=True, player_id=player_id)
         active_profile_tab(pm, step, player_id)
-        log(f"  [{step}] post command id {REDEEM_COUPON_COMMAND_ID} (Redeem Coupon...)")
-        pm.post_command(REDEEM_COUPON_COMMAND_ID)
+
+        def redeem(attempt):
+            log(f"  [{step}] post command id {REDEEM_COUPON_COMMAND_ID} (Redeem Coupon...)")
+            pm.post_command(REDEEM_COUPON_COMMAND_ID)
+
+        redeem_screen = screen_is((), main_enabled=True)
     else:
-        menu = check_state(pm, step, popups=(MENU,), main_enabled=True, player_id=player_id).get(MENU)
-        log(f"  [{step}] click menu item '{REDEEM_MENU_ITEM}'")
-        if not pm.click_menu_item(menu.hwnd, REDEEM_MENU_ITEM):
-            raise StepError(step, f"Menu item '{REDEEM_MENU_ITEM}' not found.")
-    wait_state(pm, step, popups=(COUPON,), main_enabled=False, player_id=player_id,
-               timeout=T_COUPON_OPEN, what="Coupon Redemption")
+        check_state(pm, step, popups=(MENU,), main_enabled=True, player_id=player_id)
+
+        def redeem(attempt):
+            menu = read_state(pm).get(MENU)
+            if menu is None:
+                log(f"  [{step}] the Options menu closed without opening Coupon Redemption; opening it again")
+                pm.click(options)
+                menu = wait_state(pm, step, popups=(MENU,), main_enabled=True, timeout=T_MENU_OPEN,
+                                  what="the Options menu").get(MENU)
+            log(f"  [{step}] click menu item '{REDEEM_MENU_ITEM}'")
+            if not pm.click_menu_item(menu.hwnd, REDEEM_MENU_ITEM):
+                raise StepError(step, f"Menu item '{REDEEM_MENU_ITEM}' not found.")
+
+        redeem_screen = lambda state: state.kinds() in ([], [MENU]) and state.main_enabled
+    attempt_until(pm, step, "open Coupon Redemption", redeem,
+                  lambda: state_if(pm, popups=(COUPON,), main_enabled=False, player_id=player_id), T_COUPON_OPEN,
+                  same_screen=redeem_screen)
+    log(f"  [{step}] post-check OK  Coupon Redemption is open")
 
     step = begin_step(progress, "9_select_competitor_coupon")
     coupon = check_state(pm, step, popups=(COUPON,), main_enabled=False, player_id=player_id).get(COUPON)
@@ -1625,25 +1717,28 @@ def run_coupon(pm, job, progress, allow_ok):
     combo = control(pm, step, coupon, COUPON_COMPETITOR_COMBO, "Competitor list", need_enabled=False)
     amount_field = control(pm, step, coupon, COUPON_AMOUNT_EDIT, "Amount", need_enabled=False)
     log(f"  [{step}] initial: Competitor list enabled={pm.enabled(combo)}, Amount enabled={pm.enabled(amount_field)}")
-    click(pm, step, coupon, COUPON_COMPETITOR_RADIO, "Competitor Coupon", expect="Competitor Coupon")
-    if not wait_until(lambda: pm.checked(radio) and not pm.checked(our_radio)
-                      and pm.enabled(combo) and pm.enabled(amount_field), T_FIELDS_ENABLE):
-        raise StepError(step, f"after Competitor Coupon: selected={pm.checked(radio)}, "
-                              f"list enabled={pm.enabled(combo)}, Amount enabled={pm.enabled(amount_field)}")
+    attempt_until(pm, step, "select Competitor Coupon",
+                  lambda attempt: click(pm, step, coupon, COUPON_COMPETITOR_RADIO, "Competitor Coupon",
+                                        expect="Competitor Coupon"),
+                  lambda: pm.checked(radio) and not pm.checked(our_radio)
+                  and pm.enabled(combo) and pm.enabled(amount_field), T_FIELDS_ENABLE,
+                  same_screen=screen_is((COUPON,), main_enabled=False),
+                  describe=lambda: f"selected={pm.checked(radio)}, list enabled={pm.enabled(combo)}, "
+                                   f"Amount enabled={pm.enabled(amount_field)}")
     wait_state(pm, step, popups=(COUPON,), main_enabled=False, player_id=player_id,
                what="Coupon Redemption only")
     log(f"  [{step}] checkpoint: Competitor Coupon selected, list and Amount enabled")
 
     step = begin_step(progress, "10_select_competitor")
     check_state(pm, step, popups=(COUPON,), main_enabled=False, player_id=player_id)
-    select_combo(pm, step, combo, competitor, "Competitor")
+    select_combo(pm, step, combo, competitor, "Competitor", screen=(COUPON,))
     wait_state(pm, step, popups=(COUPON,), main_enabled=False, player_id=player_id,
                what="Coupon Redemption only")
     log(f"  [{step}] checkpoint: Competitor = {competitor}")
 
     step = begin_step(progress, "11_enter_amount")
     check_state(pm, step, popups=(COUPON,), main_enabled=False, player_id=player_id)
-    set_and_verify(pm, step, amount_field, amount, "Amount", numeric=True)
+    set_and_verify(pm, step, amount_field, amount, "Amount", numeric=True, screen=(COUPON,))
     wait_state(pm, step, popups=(COUPON,), main_enabled=False, player_id=player_id,
                quiet=0.5, what="no popup after entering the amount")
 
@@ -1677,11 +1772,14 @@ def run_bbr(pm, job, progress, allow_ok):
                               f"button '{pm.text(adjust)}'.")
     if not inside(pm.rect(frame), pm.rect(bbr)) or not inside(pm.rect(frame), pm.rect(adjust)):
         raise StepError(step, "BBR / Adjust are not inside the Rewards frame.")
-    if not pm.checked(bbr):
-        log(f"  [{step}] click BBR (id={BBR_RADIO})")
-        pm.click(bbr)
-    if not wait_until(lambda: pm.checked(bbr) and pm.enabled(adjust), T_VERIFY):
-        raise StepError(step, f"BBR selected={pm.checked(bbr)}, Adjust enabled={pm.enabled(adjust)}.")
+    def select_bbr(attempt):
+        if not pm.checked(bbr):
+            log(f"  [{step}] click BBR (id={BBR_RADIO})")
+            pm.click(bbr)
+
+    attempt_until(pm, step, "select BBR", select_bbr, lambda: pm.checked(bbr) and pm.enabled(adjust), T_VERIFY,
+                  same_screen=screen_is((), main_enabled=True),
+                  describe=lambda: f"BBR selected={pm.checked(bbr)}, Adjust enabled={pm.enabled(adjust)}")
     wait_state(pm, step, popups=(), main_enabled=True, player_id=player_id, quiet=0.5,
                what="PM idle with BBR selected")
     log(f"  [{step}] checkpoint: BBR selected")
@@ -1690,10 +1788,15 @@ def run_bbr(pm, job, progress, allow_ok):
     check_state(pm, step, popups=(), main_enabled=True, player_id=player_id)
     if not pm.checked(bbr):
         raise StepError(step, "BBR is no longer selected.")
-    log(f"  [{step}] click Adjust (id={ADJUST_BUTTON})")
-    pm.click(adjust)
-    dialog = wait_state(pm, step, popups=(ADJUST,), main_enabled=False, player_id=player_id,
-                        timeout=T_ADJUST_OPEN, what="Player Adjustment").get(ADJUST)
+    def press_adjust(attempt):
+        log(f"  [{step}] click Adjust (id={ADJUST_BUTTON})")
+        pm.click(adjust)
+
+    dialog = attempt_until(pm, step, "open Player Adjustment", press_adjust,
+                           lambda: state_if(pm, popups=(ADJUST,), main_enabled=False, player_id=player_id),
+                           T_ADJUST_OPEN,
+                           same_screen=lambda state: screen_is((), main_enabled=True)(state) and pm.checked(bbr)
+                           ).get(ADJUST)
     header = control(pm, step, dialog, ADJ_HEADER, "adjustment header", need_enabled=False)
     if pm.text(header).strip() != "BBR Adjustment":
         raise StepError(step, f"Player Adjustment is '{pm.text(header)}', expected 'BBR Adjustment'.")
@@ -1704,10 +1807,13 @@ def run_bbr(pm, job, progress, allow_ok):
     add = control(pm, step, dialog, ADJ_ADD_RADIO, "Add BBR", expect="Add BBR")
     others = [control(pm, step, dialog, cid, name, need_enabled=False)
               for cid, name in ((ADJ_SUBTRACT_RADIO, "Subtract BBR"), (ADJ_ZERO_RADIO, "Set BBR to 0"))]
-    if not pm.checked(add):
-        click(pm, step, dialog, ADJ_ADD_RADIO, "Add BBR", expect="Add BBR")
-    if not wait_until(lambda: pm.checked(add) and not any(pm.checked(h) for h in others), T_VERIFY):
-        raise StepError(step, "Add BBR is not the only selected option.")
+    def select_add(attempt):
+        if not pm.checked(add) or any(pm.checked(h) for h in others):
+            click(pm, step, dialog, ADJ_ADD_RADIO, "Add BBR", expect="Add BBR")
+
+    attempt_until(pm, step, "select Add BBR", select_add,
+                  lambda: pm.checked(add) and not any(pm.checked(h) for h in others), T_VERIFY,
+                  same_screen=screen_is((ADJUST,), main_enabled=False))
     log(f"  [{step}] checkpoint: Add BBR selected")
 
     step = begin_step(progress, "10_enter_adjustment")
@@ -1717,21 +1823,32 @@ def run_bbr(pm, job, progress, allow_ok):
     new_label = control(pm, step, dialog, ADJ_NEW, "New Balance", need_enabled=False)
     if current is None:
         raise StepError(step, "Current Balance is not readable.")
-    set_and_verify(pm, step, amount_field, amount, "Adjustment", numeric=True)
     expected_new = round(current + float(amount), 2)
-    if not wait_until(lambda: money(pm.text(new_label)) is not None
-                      and abs(money(pm.text(new_label)) - expected_new) < 0.005, T_VERIFY):
-        raise StepError(step, f"New Balance shows '{pm.text(new_label)}', expected {expected_new:.2f} "
-                              f"(current {current:.2f} + {amount}).")
+
+    def new_balance_ok():
+        value = money(pm.text(new_label))
+        return value is not None and abs(value - expected_new) < 0.005
+
+    # The amount is rewritten if PM did not take it (New Balance must follow it).
+    attempt_until(pm, step, f"Adjustment = {amount}", lambda attempt: pm.set_text(amount_field, amount),
+                  lambda: normalized_number_text(pm.text(amount_field)) == normalized_number_text(amount)
+                  and new_balance_ok(), T_VERIFY,
+                  same_screen=screen_is((ADJUST,), main_enabled=False),
+                  describe=lambda: f"Adjustment shows '{pm.text(amount_field)}', New Balance shows "
+                                   f"'{pm.text(new_label)}', expected {expected_new:.2f} = {current:.2f} + {amount}")
+    log(f"  [{step}] checkpoint: Adjustment = {amount}")
     log(f"  [{step}] checkpoint: New Balance {current:.2f} + {amount} = {expected_new:.2f}")
 
     step = begin_step(progress, "11_set_expiration")
     check_state(pm, step, popups=(ADJUST,), main_enabled=False, player_id=player_id)
     picker = control(pm, step, dialog, ADJ_EXPIRATION, "Expiration")
-    log(f"  [{step}] set Expiration to {expires:%m/%d/%Y %I:%M %p}")
-    pm.date_set(picker, expires)
-    if not wait_until(lambda: pm.date_get(picker) == expires, T_VERIFY):
-        raise StepError(step, f"Expiration shows {pm.date_get(picker)}, expected {expires}.")
+    def set_date(attempt):
+        log(f"  [{step}] set Expiration to {expires:%m/%d/%Y %I:%M %p}")
+        pm.date_set(picker, expires)
+
+    attempt_until(pm, step, "Expiration", set_date, lambda: pm.date_get(picker) == expires, T_VERIFY,
+                  same_screen=screen_is((ADJUST,), main_enabled=False),
+                  describe=lambda: f"Expiration shows {_safe_done(lambda: pm.date_get(picker))}")
     wait_state(pm, step, popups=(ADJUST,), main_enabled=False, player_id=player_id, quiet=0.3,
                what="Player Adjustment only")
     log(f"  [{step}] checkpoint: Expiration = {expires:%m/%d/%Y %I:%M %p}")
@@ -1739,7 +1856,7 @@ def run_bbr(pm, job, progress, allow_ok):
     step = begin_step(progress, "12_select_reason")
     check_state(pm, step, popups=(ADJUST,), main_enabled=False, player_id=player_id)
     reason_combo = control(pm, step, dialog, ADJ_REASON_COMBO, "Reason")
-    select_combo(pm, step, reason_combo, wf["reason"], "Reason")
+    select_combo(pm, step, reason_combo, wf["reason"], "Reason", screen=(ADJUST,))
     wait_state(pm, step, popups=(ADJUST,), main_enabled=False, player_id=player_id,
                what="Player Adjustment only")
     log(f"  [{step}] checkpoint: Reason = {wf['reason']}")
@@ -1747,7 +1864,7 @@ def run_bbr(pm, job, progress, allow_ok):
     step = begin_step(progress, "13_enter_comment")
     check_state(pm, step, popups=(ADJUST,), main_enabled=False, player_id=player_id)
     comment_field = control(pm, step, dialog, ADJ_COMMENT_EDIT, "Comment")
-    set_and_verify(pm, step, comment_field, comment, "Comment")
+    set_and_verify(pm, step, comment_field, comment, "Comment", screen=(ADJUST,))
     wait_state(pm, step, popups=(ADJUST,), main_enabled=False, player_id=player_id, quiet=0.5,
                what="no popup after the comment")
 
@@ -1785,6 +1902,15 @@ def process_job(pm, job, progress, allow_ok=False):
         run_bbr(pm, job, progress, allow_ok)
 
 
+def close_tab_until_gone(pm, step, tab, what):
+    def close(attempt):
+        log(f"  [{step}] {what}")
+        pm.close_tab(tab)
+
+    attempt_until(pm, step, what, close, lambda: not pm.exists(tab) or not pm.visible(tab), T_TAB_CLOSE,
+                  same_screen=screen_is((), main_enabled=True))
+
+
 def close_profile_tabs(pm, tabs):
     step = "13_close_profile_tabs"
     log(f"Closing {len(tabs)} profile tab(s) opened by this run.")
@@ -1797,10 +1923,7 @@ def close_profile_tabs(pm, tabs):
             log(f"  [{step}] skip tab #{tab}: title '{title}' is not player {player_id}")
             continue
         check_state(pm, step, popups=(), main_enabled=True)
-        log(f"  [{step}] close tab '{title}'")
-        pm.close_tab(tab)
-        if not wait_until(lambda: not pm.exists(tab) or not pm.visible(tab), T_TAB_CLOSE):
-            raise StepError(step, f"tab '{title}' did not close. State: {read_state(pm).summary()}")
+        close_tab_until_gone(pm, step, tab, f"close tab '{title}'")
         wait_state(pm, step, popups=(), main_enabled=True, timeout=T_TAB_CLOSE, quiet=0.5,
                    what="PM idle after closing the tab")
         closed += 1
