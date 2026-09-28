@@ -47,6 +47,7 @@ from pathlib import Path
 from openpyxl import Workbook, load_workbook
 
 try:
+    import win32api
     import win32con
     import win32gui
     import win32process
@@ -58,7 +59,7 @@ try:
 except ImportError:  # lets the step logic be imported and tested off Windows
     win32con = win32gui = win32process = None
 
-RUNNER_VERSION = "4.0-four-workflows"
+RUNNER_VERSION = "4.1-four-workflows"
 BASE_DIR = Path(__file__).resolve().parent
 EXCEL_FILE = BASE_DIR / "Excel-for-auto.xlsx"
 LOG_FILE = BASE_DIR / "pm_automation_log.csv"
@@ -93,7 +94,8 @@ STEP_DELAY_SECONDS = 2.0   # pause before every step
 CONTROL_MODE = "background"   # "background": messages + UIA only; "mouse": physical clicks (v2)
 # Optional WM_COMMAND ids. When set, the command is posted to the PM main window
 # instead of using the Ribbon button / the Options menu.
-FIND_PLAYER_COMMAND_ID = None
+FIND_PLAYER_COMMAND_ID = None     # None: found automatically from PM's Ctrl+F accelerator
+FIND_ACCELERATOR = (ord("F"), "CTRL")
 REDEEM_COUPON_COMMAND_ID = None
 LEDGER_FILE = BASE_DIR / "pm_redeemed_ledger.csv"
 CLOSE_TABS_AT_END = True
@@ -114,6 +116,7 @@ T_ADJUST_OPEN = 5          # 0.24-0.27s after Adjust
 T_FIELDS_ENABLE = 3        # 0.13-0.24s after Competitor Coupon
 T_VERIFY = 3
 T_UIA_INVOKE = 10          # UIA call may stay blocked while PM shows the dialog it opened
+T_UIA_READ = 4             # reading texts through UIA; never allowed to block a step
 T_TAB_CLOSE = 5
 QUIET_SECONDS = 1.0        # measured gap between System Messages and Player Comment: 0.04-0.05s
 SAME_PLAYER_WAIT_SECONDS = 8.0      # profile load measured 4.1-5.2s
@@ -558,6 +561,51 @@ class Win32PM:
         self.main = found[0]
         self.pid = win32process.GetWindowThreadProcessId(self.main)[1]
         log(f"Connected to PM: main HWND={self.main}, PID={self.pid}")
+        self.find_command = FIND_PLAYER_COMMAND_ID
+        if not self.find_command:
+            try:
+                self.find_command = self._accelerator_command(*FIND_ACCELERATOR)
+            except Exception as exc:
+                log(f"Could not read PM's shortcut table: {exc}")
+        log("Find a Player: " + (f"command id {self.find_command} (the Ctrl+F command, sent without the keyboard)"
+                                   if self.find_command else "Ribbon button through UIA"))
+
+    def _accelerator_command(self, key, modifier):
+        """Command ID PM binds to a shortcut such as Ctrl+F, read from its accelerator tables."""
+        flags_wanted = 0x01 | {"CTRL": 0x08, "SHIFT": 0x04, "ALT": 0x10}[modifier]   # FVIRTKEY | modifier
+        process = win32api.OpenProcess(win32con.PROCESS_QUERY_INFORMATION | win32con.PROCESS_VM_READ,
+                                       False, self.pid)
+        exe = win32process.GetModuleFileNameEx(process, None)
+        folder = str(Path(exe).parent).casefold()
+        modules = [exe] + [m for m in (win32process.GetModuleFileNameEx(process, h)
+                                        for h in win32process.EnumProcessModules(process))
+                           if str(Path(m).parent).casefold() == folder and m != exe]
+        commands = {}
+        for path in modules:
+            try:
+                module = win32api.LoadLibraryEx(path, 0, win32con.LOAD_LIBRARY_AS_DATAFILE)
+            except win32api.error:
+                continue
+            try:
+                try:
+                    names = win32api.EnumResourceNames(module, win32con.RT_ACCELERATOR)
+                except win32api.error:
+                    names = []
+                for name in names:
+                    data = win32api.LoadResource(module, win32con.RT_ACCELERATOR, name)
+                    for offset in range(0, len(data) - 7, 8):
+                        flags, vk, command, _ = struct.unpack_from("<HHHH", data, offset)
+                        if flags & 0x1D == flags_wanted and vk == key:
+                            commands.setdefault(command, []).append(f"{Path(path).name}#{name}")
+                        if flags & 0x80:
+                            break
+            finally:
+                win32api.FreeLibrary(module)
+        if len(commands) == 1:
+            return next(iter(commands))
+        if commands:
+            log(f"{modifier}+{chr(key)} maps to several commands {commands}; not used.")
+        return None
 
     def main_title(self):
         return self.window_title(self.main)
@@ -727,8 +775,10 @@ class Win32PM:
         send_keys("{HOME}+{END}{DEL}")
         send_keys(escape_keys(value), with_spaces=True)
 
-    def post_command(self, command_id):
-        win32gui.PostMessage(self.main, win32con.WM_COMMAND, int(command_id) & 0xFFFF, 0)
+    def post_command(self, command_id, accelerator=False):
+        """Post WM_COMMAND to the main window (as a menu, or as the shortcut when accelerator=True)."""
+        win32gui.PostMessage(self.main, win32con.WM_COMMAND,
+                             ((1 if accelerator else 0) << 16) | (int(command_id) & 0xFFFF), 0)
 
     def rect(self, hwnd):
         return win32gui.GetWindowRect(hwnd)
@@ -761,14 +811,40 @@ class Win32PM:
         finally:
             del remote
 
+    def _uia_read(self, read, what, timeout=T_UIA_READ):
+        """Run a UIA read in a worker thread; give up after `timeout` instead of blocking the run.
+
+        A UIA call can wait behind another UIA call PM has not answered yet (for example an
+        Invoke that opened a modal dialog), so a read must never hold up the next step.
+        """
+        outcome = {}
+
+        def work():
+            try:
+                import pythoncom
+                pythoncom.CoInitializeEx(pythoncom.COINIT_MULTITHREADED)
+            except Exception:
+                pass
+            try:
+                outcome["value"] = read()
+            except Exception as exc:
+                outcome["error"] = exc
+
+        worker = threading.Thread(target=work, daemon=True)
+        worker.start()
+        worker.join(timeout)
+        if "value" in outcome:
+            return outcome["value"]
+        reason = outcome.get("error") or f"no answer within {timeout}s"
+        log(f"    ({what} not readable through UIA: {reason}; continuing without it)")
+        return None
+
     def list_items_levels(self, popup_hwnd):
         """(text, left) of each list item, e.g. System Messages; left gives the indent level."""
-        try:
-            return [(i.window_text().strip(), i.rectangle().left)
-                    for i in self._uia(popup_hwnd).descendants(control_type="ListItem")
-                    if i.window_text().strip()]
-        except Exception:
-            return []
+        items = self._uia_read(lambda: [(i.window_text().strip(), i.rectangle().left)
+                                        for i in self._uia(popup_hwnd).descendants(control_type="ListItem")
+                                        if i.window_text().strip()], "System Messages text")
+        return items or []
 
     def control_colors(self, hwnd):
         """Colours of a control, read from PM's own rendering (PrintWindow: no focus, works when covered)."""
@@ -890,8 +966,10 @@ class Win32PM:
 
     def click_ribbon_find(self):
         if background_mode():
-            if FIND_PLAYER_COMMAND_ID:
-                self.post_command(FIND_PLAYER_COMMAND_ID)
+            if getattr(self, "find_command", None):
+                # Same WM_COMMAND the Ctrl+F shortcut sends. Unlike a UIA Invoke it does not
+                # leave a call pending inside PM while Find a Player / System Messages are open.
+                self.post_command(self.find_command, accelerator=True)
                 return True
             return self._uia_invoke(self.main, FIND_RIBBON_BUTTON, "Button")
         self.focus(self.main)
@@ -929,11 +1007,10 @@ class Win32PM:
         return False
 
     def list_items(self, popup_hwnd):
-        try:
-            return [clean for clean in (i.window_text().strip() for i in
-                    self._uia(popup_hwnd).descendants(control_type="ListItem")) if clean]
-        except Exception:
-            return []
+        items = self._uia_read(lambda: [t for t in (i.window_text().strip() for i in
+                                        self._uia(popup_hwnd).descendants(control_type="ListItem")) if t],
+                               "list items")
+        return items or []
 
     def mdi_active(self):
         client = win32gui.FindWindowEx(self.main, 0, "MDIClient", None)
@@ -1178,11 +1255,22 @@ def ensure_logged_in(pm, username, password):
 def open_find_player(pm, step):
     check_state(pm, step, popups=(), main_enabled=True)
     clicked = False
+    command = getattr(pm, "find_command", None) if background_mode() else None
     try:
-        log(f"  [{step}] click Ribbon '{FIND_RIBBON_BUTTON}'")
+        log(f"  [{step}] " + (f"send the Ctrl+F command (id {command})" if command
+                              else f"click Ribbon '{FIND_RIBBON_BUTTON}'"))
         clicked = pm.click_ribbon_find()
     except Exception as exc:
-        log(f"  [{step}] Ribbon click failed: {exc}")
+        log(f"  [{step}] opening Find a Player failed: {exc}")
+    if clicked and command:
+        state = wait_state(pm, step, popups=(FIND,), main_enabled=False, timeout=T_FIND_OPEN,
+                           what="Find a Player", fail=False)
+        if state:
+            return state
+        if not read_state(pm).popups and read_state(pm).main_enabled:
+            log(f"  [{step}] command {command} did not open Find a Player; using the Ribbon button")
+            pm.find_command = None
+            clicked = pm.click_ribbon_find()
     if clicked:
         state = wait_state(pm, step, popups=(FIND,), main_enabled=False, timeout=T_FIND_OPEN,
                            what="Find a Player", fail=False)
