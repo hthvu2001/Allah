@@ -1,0 +1,1892 @@
+# -*- coding: utf-8 -*-
+"""Patron Management rewards automation - v4: four workflows, background control.
+
+Reads Excel-for-auto.xlsx and runs, in this order (rows in Excel order):
+  #1 REBATE_SLOT  sheet REBATE, SLOT REBATE 5% != 0
+                  Coupon Redemption > Competitor Coupon > DAILY REBATE (5%) - 1 > Amount
+  #2 REBATE_BBR   sheet REBATE, BBR REBATE 5% != 0
+                  Rewards: BBR > Adjust > Add BBR, Adjustment, Expiration = today + 30 days
+                  05:59 AM, Reason "P) Your 5% (Rebate)", Comment "REBATE ON <yesterday>"
+  #3 COSMO_SLOT   sheet DAILY REWARDS, ALLOCATION = Slot
+                  Coupon Redemption > Competitor Coupon > COSMO ELITE CIRCUIT - 166 > Amount
+  #4 COSMO_BBR    sheet DAILY REWARDS, ALLOCATION = BBR
+                  Rewards: BBR > Adjust > Add BBR, Adjustment, Expiration = today + 3 days
+                  05:59 AM, Reason "P) COSMO ELITE CIRCUIT", Comment "COSMO ELITE CIRCUIT"
+
+Before touching PM the Excel is checked and a report pm_excel_check_<time>.xlsx
+is written (PLAN, NOTES, VIOLATIONS). The run stops if there is any violation:
+the same player with both Slot and BBR in REBATE or in DAILY REWARDS, a player
+twice in the same part, or invalid data. TEST_PLAYER_IDS (10001) are exempt from
+the conflict / duplicate rules. Rows where both REBATE columns are 0 are skipped
+and noted.
+
+Every job: pre-check idle PM, Find a Player (Ribbon / command), enter the ID,
+OK, wait for the profile, handle System Messages / Player Comment, check the
+Identification name (skip "(Loc:"), then the workflow steps, each with a check
+before and after. At start the runner asks whether it may click OK (YES = real
+redemption / adjustment, anything else = Cancel test run). OK clicks are
+written to pm_redeemed_ledger.csv per player and workflow, and a rerun on the
+same day skips them. The first error stops the run and leaves PM as it is.
+
+Control: CONTROL_MODE = "background" drives PM with Win32 messages and UIA
+Invoke only (no mouse, no keyboard, no focus). Controls are found by their
+control IDs, never by screen coordinates.
+"""
+
+import csv
+import ctypes
+import re
+import struct
+import sys
+import threading
+import time
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta
+from pathlib import Path
+
+from openpyxl import Workbook, load_workbook
+
+try:
+    import win32con
+    import win32gui
+    import win32process
+    from pywinauto import Desktop, handleprops, mouse
+    from pywinauto import uia_defines
+    from pywinauto.remote_memory_block import RemoteMemoryBlock
+    from pywinauto.controls.hwndwrapper import HwndWrapper
+    from pywinauto.keyboard import send_keys
+except ImportError:  # lets the step logic be imported and tested off Windows
+    win32con = win32gui = win32process = None
+
+RUNNER_VERSION = "4.0-four-workflows"
+BASE_DIR = Path(__file__).resolve().parent
+EXCEL_FILE = BASE_DIR / "Excel-for-auto.xlsx"
+LOG_FILE = BASE_DIR / "pm_automation_log.csv"
+TEXT_LOG_FILE = BASE_DIR / "pm_runner_log.txt"
+REBATE_SHEET = "REBATE"
+REBATE_COLUMNS = ("Player ID", "SLOT REBATE 5%", "BBR REBATE 5%")
+DAILY_SHEET = "DAILY REWARDS"
+DAILY_COLUMNS = ("PLAYER ID", "FREE PLAY", "ALLOCATION")
+TEST_PLAYER_IDS = {"10001"}        # exempt from the conflict / duplicate rules
+EXPIRATION_TIME = (5, 59)          # 05:59 AM
+MONTHS = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"]
+NOTIFY_DATE_CHANGE = True          # tell the dialog the Expiration changed, as a user edit would
+
+
+def rebate_comment(today):
+    yesterday = today - timedelta(days=1)
+    return f"REBATE ON {MONTHS[yesterday.month - 1]} {yesterday.day:02d} {yesterday.year}"
+
+
+WORKFLOWS = {
+    "REBATE_SLOT": {"no": 1, "label": "Rebate Slot", "kind": "coupon",
+                    "competitor": "DAILY REBATE (5%) - 1"},
+    "REBATE_BBR": {"no": 2, "label": "Rebate BBR", "kind": "bbr", "expire_days": 30,
+                   "reason": "P) Your 5% (Rebate)", "comment": rebate_comment},
+    "COSMO_SLOT": {"no": 3, "label": "COSMO ELITE CIRCUIT Slot", "kind": "coupon",
+                   "competitor": "COSMO ELITE CIRCUIT - 166"},
+    "COSMO_BBR": {"no": 4, "label": "COSMO ELITE CIRCUIT BBR", "kind": "bbr", "expire_days": 3,
+                  "reason": "P) COSMO ELITE CIRCUIT", "comment": lambda today: "COSMO ELITE CIRCUIT"},
+}
+WORKFLOW_ORDER = ["REBATE_SLOT", "REBATE_BBR", "COSMO_SLOT", "COSMO_BBR"]
+STEP_DELAY_SECONDS = 2.0   # pause before every step
+CONTROL_MODE = "background"   # "background": messages + UIA only; "mouse": physical clicks (v2)
+# Optional WM_COMMAND ids. When set, the command is posted to the PM main window
+# instead of using the Ribbon button / the Options menu.
+FIND_PLAYER_COMMAND_ID = None
+REDEEM_COUPON_COMMAND_ID = None
+LEDGER_FILE = BASE_DIR / "pm_redeemed_ledger.csv"
+CLOSE_TABS_AT_END = True
+FIND_SHORTCUT = "^f"
+
+# Timeouts (seconds). Measured values from the v5 recordings in comments.
+T_LOGIN = 90
+T_FIND_OPEN = 3            # 0.21-0.31s
+T_FIND_CLOSE = 5           # 0.02-0.16s
+T_PROFILE_LOAD = 30        # 4.1-5.2s from OK to the new title
+T_PROFILE_POPUPS = 60      # System Messages + paging through all comments
+T_POPUP_CLOSE = 5          # 0.12-0.15s
+T_AFTER_OK = 20            # not recorded yet: OK has never been clicked in a recording
+T_COMMENT_PAGE = 3         # 0.11-0.2s per Next
+T_MENU_OPEN = 3            # 0.15-0.18s
+T_COUPON_OPEN = 5          # 0.21-0.22s
+T_ADJUST_OPEN = 5          # 0.24-0.27s after Adjust
+T_FIELDS_ENABLE = 3        # 0.13-0.24s after Competitor Coupon
+T_VERIFY = 3
+T_UIA_INVOKE = 10          # UIA call may stay blocked while PM shows the dialog it opened
+T_TAB_CLOSE = 5
+QUIET_SECONDS = 1.0        # measured gap between System Messages and Player Comment: 0.04-0.05s
+SAME_PLAYER_WAIT_SECONDS = 8.0      # profile load measured 4.1-5.2s
+POLL = 0.1
+MAX_COMMENT_PAGES = 200
+
+# Native control IDs (identical in every recording).
+ID_OK = 1
+ID_CANCEL = 2
+FIND_PLAYER_ID_EDIT = 1041
+SYSMSG_CLOSE = 1
+COMMENT_NEXT = 1002
+COMMENT_PREVIOUS = 1003
+COMMENT_CLOSE = 2
+COMMENT_HEADER = 100
+OPTIONS_BUTTON = 1074
+COUPON_OUR_RADIO = 1481
+COUPON_COMPETITOR_RADIO = 1484
+COUPON_ID_EDIT = 1477
+COUPON_COMPETITOR_COMBO = 1483
+COUPON_AMOUNT_EDIT = 1107
+COUPON_CLICKABLE_IDS = {COUPON_COMPETITOR_RADIO, COUPON_COMPETITOR_COMBO, COUPON_AMOUNT_EDIT, ID_CANCEL}
+REDEEM_MENU_ITEM = "Redeem Coupon..."
+REWARDS_FRAME_ID = 3924        # group box "Rewards" on the profile
+BBR_RADIO = 2351               # "BBR" in Rewards
+ADJUST_BUTTON = 1106           # "Adjust" in Rewards
+ADJ_HEADER = 1983              # "BBR Adjustment"
+ADJ_ADD_RADIO = 1053           # Add BBR (default)
+ADJ_SUBTRACT_RADIO = 1054
+ADJ_ZERO_RADIO = 1055          # Set BBR balance to 0
+ADJ_CURRENT = 1146             # Current Balance
+ADJ_AMOUNT_EDIT = 1147         # Adjustment
+ADJ_NEW = 1121                 # New Balance (updates while typing)
+ADJ_EXPIRATION = 1031          # date/time picker
+ADJ_REASON_COMBO = 1100
+ADJ_COMMENT_EDIT = 1004
+ADJUST_CLICKABLE_IDS = {ADJ_ADD_RADIO, ID_CANCEL}
+DTN_DATETIMECHANGE = -759
+IDENT_FRAME_ID = 3923          # group box "Identification" (same in every recording)
+IDENT_NAME_ID = 1034           # player name inside Identification
+SKIP_NAME_RE = re.compile(r"\(\s*Loc\s*:", re.I)
+FIND_RIBBON_BUTTON = "Find Player"
+
+# Popup kinds.
+LOGIN, FIND, SYSMSG, COMMENT, COUPON, ADJUST, MENU, DROPDOWN, UNKNOWN = (
+    "LOGIN", "FIND", "SYSTEM_MESSAGES", "PLAYER_COMMENT", "COUPON", "ADJUSTMENT", "MENU", "DROPDOWN",
+    "UNKNOWN")
+DIALOG_TITLES = {
+    "find a player": FIND,
+    "system messages": SYSMSG,
+    "system message": SYSMSG,
+    "player comment": COMMENT,
+    "coupon redemption": COUPON,
+    "player adjustment": ADJUST,
+}
+LOGIN_TITLE_RE = re.compile(r"^Patron Management\s+(?:Log\s*on|Log\s*in)$", re.I)
+MAIN_TITLE_RE = re.compile(r"^Patron Management(?: - .+)?$")
+MAIN_CLASSES = {"XTPMainFrame"}
+MIN_POPUP_SIZE = 9          # XTP menu shadows are 4px wide windows
+IGNORED_CLASS_RE = re.compile(r"tooltip|shadow|PopupBubbleWnd|^IME$|MSCTFIME", re.I)
+LOGIN_BUTTON_NAMES = {"login", "log in", "logon", "log on", "sign in", "ok"}
+WM_MDIGETACTIVE = 0x0229
+BN_CLICKED = 0
+BS_TYPEMASK = 0x0F
+RADIO_STYLES = {4, 9}         # BS_RADIOBUTTON, BS_AUTORADIOBUTTON
+CHECKBOX_STYLES = {2, 3, 5, 6}
+
+
+def background_mode():
+    return CONTROL_MODE == "background"
+
+
+class StepError(RuntimeError):
+    def __init__(self, step, message):
+        super().__init__(message)
+        self.step = step
+
+
+class PlayerSkipped(Exception):
+    """The player must not be processed; logged and the run continues."""
+
+    def __init__(self, status, message):
+        super().__init__(message)
+        self.status = status
+
+
+def color_name(rgb):
+    r, g, b = rgb
+    if max(rgb) - min(rgb) < 30:
+        return "white" if min(rgb) > 200 else "black" if max(rgb) < 70 else "gray"
+    if g >= r + 30 and g >= b + 30:
+        return "green"
+    if b >= r + 30 and b >= g - 10:
+        return "blue"
+    if r >= g + 30 and r >= b + 30:
+        return "red"
+    if r > 150 and g > 150 and b < 110:
+        return "yellow"
+    return "other"
+
+
+def region_colors(image, x0, y0, x1, y1):
+    """Background (most common) and text (most common clearly different) colour of a region."""
+    width, height, raw = image
+    counts, rows = {}, []
+    for y in range(max(0, y0), min(height, y1)):
+        row = y * width * 4
+        row_counts = {}
+        for x in range(max(0, x0), min(width, x1)):
+            i = row + x * 4
+            key = (raw[i + 2] & 0xF8, raw[i + 1] & 0xF8, raw[i] & 0xF8)
+            row_counts[key] = row_counts.get(key, 0) + 1
+        rows.append(row_counts)
+        for key, n in row_counts.items():
+            counts[key] = counts.get(key, 0) + n
+    if not counts:
+        return None
+    ranked = sorted(counts, key=counts.get, reverse=True)
+    background = ranked[0]
+
+    def different(c):
+        return sum(abs(a - b) for a, b in zip(c, background)) > 90
+
+    # Text pixels are counted without rows that are one solid line (borders, underlines).
+    text_counts = {}
+    for row_counts in rows:
+        total = sum(row_counts.values())
+        line = max(row_counts.values()) >= 0.7 * total and max(row_counts, key=row_counts.get) != background
+        if line:
+            continue
+        for key, n in row_counts.items():
+            if different(key):
+                text_counts[key] = text_counts.get(key, 0) + n
+    text = max(text_counts, key=text_counts.get) if text_counts else None
+    return {"text_color": color_name(text) if text else "none", "background_color": color_name(background),
+            "text_rgb": "#%02x%02x%02x" % text if text else "", "background_rgb": "#%02x%02x%02x" % background}
+
+
+def log(message):
+    line = f"[{datetime.now().strftime('%H:%M:%S')}] {message}"
+    print(line, flush=True)
+    try:
+        with TEXT_LOG_FILE.open("a", encoding="utf-8") as file:
+            file.write(line + "\n")
+    except OSError:
+        pass
+
+
+# ------------------------------------------------------------------ Excel
+
+def original_excel_text(value):
+    """Preserve Excel's value representation without padding or recalculation."""
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "TRUE" if value else "FALSE"
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        return str(int(value)) if value.is_integer() else format(value, "g")
+    return str(value).strip()
+
+
+def numeric_nonzero(value):
+    if value is None or value == "":
+        return False
+    try:
+        return float(value) != 0
+    except (TypeError, ValueError):
+        raise ValueError(f"Invalid rebate value: {value!r}")
+
+
+def sheet_rows(wb, sheet_name, columns):
+    """(excel_row, values...) for every non-empty row of a sheet with the given headers."""
+    if sheet_name not in wb.sheetnames:
+        raise KeyError(f"Sheet not found: {sheet_name}")
+    rows = wb[sheet_name].iter_rows(values_only=True)
+    headers = next(rows, None) or ()
+    normalized = [str(x).strip().casefold() if x is not None else "" for x in headers]
+    try:
+        indexes = [normalized.index(c.casefold()) for c in columns]
+    except ValueError as exc:
+        raise ValueError(f"Sheet {sheet_name}: required columns {columns} not found") from exc
+    for excel_row, row in enumerate(rows, start=2):
+        values = [row[i] if i < len(row) else None for i in indexes]
+        if all(v is None or str(v).strip() == "" for v in values):
+            continue
+        yield excel_row, values
+
+
+def parse_amount(value):
+    if value is None or str(value).strip() == "":
+        return 0.0
+    return float(value)
+
+
+def job_details(workflow, today):
+    wf = WORKFLOWS[workflow]
+    if wf["kind"] == "coupon":
+        return {"target": wf["competitor"], "expiration": "", "comment": ""}
+    expires = expiration_for(workflow, today)
+    return {"target": wf["reason"], "expiration": expires.strftime("%m/%d/%Y %I:%M %p"),
+            "comment": wf["comment"](today)}
+
+
+def expiration_for(workflow, today):
+    day = today + timedelta(days=WORKFLOWS[workflow]["expire_days"])
+    return datetime(day.year, day.month, day.day, *EXPIRATION_TIME)
+
+
+def read_plan(today):
+    """Jobs in run order, notes (skipped rows) and violations (stop the run)."""
+    jobs = {w: [] for w in WORKFLOW_ORDER}
+    notes, violations = [], []
+    if not EXCEL_FILE.exists():
+        raise FileNotFoundError(f"Excel file not found: {EXCEL_FILE}")
+    wb = load_workbook(EXCEL_FILE, data_only=True, read_only=True)
+    try:
+        for row, (pid_value, slot_value, bbr_value) in sheet_rows(wb, REBATE_SHEET, REBATE_COLUMNS):
+            pid = original_excel_text(pid_value)
+            try:
+                slot, bbr = parse_amount(slot_value), parse_amount(bbr_value)
+            except (TypeError, ValueError):
+                violations.append({"rule": "Invalid amount", "sheet": REBATE_SHEET, "rows": str(row),
+                                   "player_id": pid, "detail": f"SLOT={slot_value!r} BBR={bbr_value!r}"})
+                continue
+            if not pid:
+                violations.append({"rule": "Missing Player ID", "sheet": REBATE_SHEET, "rows": str(row),
+                                   "player_id": "", "detail": f"SLOT={slot_value!r} BBR={bbr_value!r}"})
+                continue
+            if slot < 0 or bbr < 0:
+                violations.append({"rule": "Negative amount", "sheet": REBATE_SHEET, "rows": str(row),
+                                   "player_id": pid, "detail": f"SLOT={slot_value} BBR={bbr_value}"})
+                continue
+            if slot == 0 and bbr == 0:
+                notes.append({"sheet": REBATE_SHEET, "row": row, "player_id": pid,
+                              "note": "SLOT and BBR are both 0 - skipped"})
+                continue
+            if slot:
+                jobs["REBATE_SLOT"].append({"workflow": "REBATE_SLOT", "sheet": REBATE_SHEET, "excel_row": row,
+                                            "player_id": pid, "amount": original_excel_text(slot_value)})
+            if bbr:
+                jobs["REBATE_BBR"].append({"workflow": "REBATE_BBR", "sheet": REBATE_SHEET, "excel_row": row,
+                                           "player_id": pid, "amount": original_excel_text(bbr_value)})
+        for row, (pid_value, amount_value, allocation_value) in sheet_rows(wb, DAILY_SHEET, DAILY_COLUMNS):
+            pid = original_excel_text(pid_value)
+            allocation = str(allocation_value or "").strip().casefold()
+            try:
+                amount = parse_amount(amount_value)
+            except (TypeError, ValueError):
+                violations.append({"rule": "Invalid amount", "sheet": DAILY_SHEET, "rows": str(row),
+                                   "player_id": pid, "detail": f"FREE PLAY={amount_value!r}"})
+                continue
+            if not pid:
+                violations.append({"rule": "Missing Player ID", "sheet": DAILY_SHEET, "rows": str(row),
+                                   "player_id": "", "detail": f"FREE PLAY={amount_value!r}"})
+                continue
+            if allocation not in ("slot", "bbr"):
+                violations.append({"rule": "Unknown ALLOCATION", "sheet": DAILY_SHEET, "rows": str(row),
+                                   "player_id": pid, "detail": f"ALLOCATION={allocation_value!r}"})
+                continue
+            if amount < 0:
+                violations.append({"rule": "Negative amount", "sheet": DAILY_SHEET, "rows": str(row),
+                                   "player_id": pid, "detail": f"FREE PLAY={amount_value}"})
+                continue
+            if amount == 0:
+                notes.append({"sheet": DAILY_SHEET, "row": row, "player_id": pid,
+                              "note": f"FREE PLAY is 0 ({allocation_value}) - skipped"})
+                continue
+            workflow = "COSMO_SLOT" if allocation == "slot" else "COSMO_BBR"
+            jobs[workflow].append({"workflow": workflow, "sheet": DAILY_SHEET, "excel_row": row,
+                                   "player_id": pid, "amount": original_excel_text(amount_value)})
+    finally:
+        wb.close()
+
+    def rows_of(workflow, pid):
+        return [j["excel_row"] for j in jobs[workflow] if j["player_id"] == pid]
+
+    for first, second, sheet in (("REBATE_SLOT", "REBATE_BBR", REBATE_SHEET),
+                                 ("COSMO_SLOT", "COSMO_BBR", DAILY_SHEET)):
+        for workflow in (first, second):
+            seen = {}
+            for job in jobs[workflow]:
+                seen.setdefault(job["player_id"], []).append(job["excel_row"])
+            for pid, rows in seen.items():
+                if len(rows) > 1:
+                    record = {"sheet": sheet, "rows": ", ".join(map(str, rows)), "player_id": pid,
+                              "detail": f"{WORKFLOWS[workflow]['label']} appears {len(rows)} times"}
+                    if pid in TEST_PLAYER_IDS:
+                        notes.append({"sheet": sheet, "row": record["rows"], "player_id": pid,
+                                      "note": record["detail"] + " - allowed for the test player"})
+                    else:
+                        violations.append(dict(record, rule="Duplicate player"))
+        both = sorted({j["player_id"] for j in jobs[first]} & {j["player_id"] for j in jobs[second]})
+        for pid in both:
+            detail = (f"{WORKFLOWS[first]['label']} rows {rows_of(first, pid)} and "
+                      f"{WORKFLOWS[second]['label']} rows {rows_of(second, pid)}")
+            if pid in TEST_PLAYER_IDS:
+                notes.append({"sheet": sheet, "row": "", "player_id": pid,
+                              "note": detail + " - allowed for the test player"})
+            else:
+                rows = sorted(set(rows_of(first, pid) + rows_of(second, pid)))
+                if len(rows) == 1:
+                    detail += " (same row)"
+                violations.append({"rule": "Slot and BBR for the same player", "sheet": sheet,
+                                   "rows": ", ".join(map(str, rows)), "player_id": pid, "detail": detail})
+    ordered = [job for workflow in WORKFLOW_ORDER for job in jobs[workflow]]
+    for job in ordered:
+        job.update(job_details(job["workflow"], today))
+    return ordered, notes, violations
+
+
+def write_check_file(jobs, notes, violations):
+    path = BASE_DIR / f"pm_excel_check_{datetime.now():%Y%m%d_%H%M%S}.xlsx"
+    wb = Workbook()
+    plan = wb.active
+    plan.title = "PLAN"
+    plan.append(["Order", "Workflow", "Sheet", "Excel row", "Player ID", "Amount", "Competitor / Reason",
+                 "Expiration", "Comment"])
+    for order, job in enumerate(jobs, start=1):
+        wf = WORKFLOWS[job["workflow"]]
+        plan.append([order, f"#{wf['no']} {wf['label']}", job["sheet"], job["excel_row"], job["player_id"],
+                     job["amount"], job["target"], job["expiration"], job["comment"]])
+    sheet = wb.create_sheet("NOTES")
+    sheet.append(["Sheet", "Excel row", "Player ID", "Note"])
+    for note in notes:
+        sheet.append([note["sheet"], note["row"], note["player_id"], note["note"]])
+    sheet = wb.create_sheet("VIOLATIONS")
+    sheet.append(["Rule", "Sheet", "Excel rows", "Player ID", "Detail"])
+    for v in violations:
+        sheet.append([v["rule"], v["sheet"], v["rows"], v["player_id"], v["detail"]])
+    if violations:
+        wb.move_sheet("VIOLATIONS", offset=-2)
+        wb.active = 0
+    wb.save(path)
+    return path
+
+
+# ------------------------------------------------------------ PM state
+
+@dataclass
+class Popup:
+    hwnd: int
+    title: str
+    class_name: str
+    kind: str
+
+    def label(self):
+        return f"{self.kind} '{self.title}' #{self.hwnd}"
+
+
+@dataclass
+class PMState:
+    title: str
+    main_enabled: bool
+    popups: list
+
+    def kinds(self):
+        return sorted(p.kind for p in self.popups)
+
+    def get(self, kind):
+        for popup in self.popups:
+            if popup.kind == kind:
+                return popup
+        return None
+
+    def summary(self):
+        popups = ", ".join(p.label() for p in self.popups) or "none"
+        return f"title='{self.title}' main_enabled={self.main_enabled} popups=[{popups}]"
+
+
+def classify(title, class_name):
+    title = (title or "").strip()
+    cls = (class_name or "").casefold()
+    if LOGIN_TITLE_RE.match(title):
+        return LOGIN
+    if cls == "#32770":
+        return DIALOG_TITLES.get(title.casefold(), UNKNOWN)
+    if "popupbar" in cls or cls == "#32768":
+        return MENU
+    if cls == "combolbox":
+        return DROPDOWN
+    return UNKNOWN
+
+
+def ids_in_title(title):
+    return [x.lstrip("0") or "0" for x in re.findall(r"\((\d+)\)", title or "")]
+
+
+def title_has_player(title, player_id):
+    expected = str(player_id).lstrip("0") or "0"
+    return expected in ids_in_title(title)
+
+
+def normalized_number_text(value):
+    value = str(value).strip().replace(",", "")
+    try:
+        number = float(value)
+        return str(int(number)) if number.is_integer() else format(number, "g")
+    except (TypeError, ValueError):
+        return value
+
+
+def escape_keys(text):
+    return "".join("{%s}" % ch if ch in "{}[]()+^%~" else ch for ch in str(text))
+
+
+# ------------------------------------------------ Win32 access to PM
+
+class Win32PM:
+    """Everything that touches the PM process lives here."""
+
+    def __init__(self):
+        if win32gui is None:
+            raise SystemExit("This runner needs Windows with pywin32 and pywinauto installed.")
+        self.pid = None
+        self.main = None
+        self._user32 = ctypes.windll.user32
+        self._user32.GetAncestor.restype = ctypes.c_void_p
+        self._user32.GetAncestor.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+
+    # -- discovery
+
+    def connect(self):
+        found = []
+
+        def callback(hwnd, _):
+            try:
+                if (win32gui.IsWindowVisible(hwnd)
+                        and win32gui.GetClassName(hwnd) in MAIN_CLASSES
+                        and MAIN_TITLE_RE.match(win32gui.GetWindowText(hwnd))):
+                    found.append(hwnd)
+            except win32gui.error:
+                pass
+            return True
+
+        win32gui.EnumWindows(callback, None)
+        if not found:
+            raise StepError("connect", "Patron Management main window not found. Open PM first.")
+        if len(found) > 1:
+            raise StepError("connect", "More than one Patron Management window is open.")
+        self.main = found[0]
+        self.pid = win32process.GetWindowThreadProcessId(self.main)[1]
+        log(f"Connected to PM: main HWND={self.main}, PID={self.pid}")
+
+    def main_title(self):
+        return self.window_title(self.main)
+
+    def main_enabled(self):
+        return bool(win32gui.IsWindowEnabled(self.main))
+
+    def popups(self):
+        found = []
+
+        def callback(hwnd, _):
+            try:
+                if hwnd == self.main or not win32gui.IsWindowVisible(hwnd):
+                    return True
+                if win32process.GetWindowThreadProcessId(hwnd)[1] != self.pid:
+                    return True
+                left, top, right, bottom = win32gui.GetWindowRect(hwnd)
+                if right - left < MIN_POPUP_SIZE or bottom - top < MIN_POPUP_SIZE:
+                    return True
+                cls = win32gui.GetClassName(hwnd)
+                if IGNORED_CLASS_RE.search(cls):
+                    return True
+                title = win32gui.GetWindowText(hwnd)
+                found.append(Popup(hwnd, title, cls, classify(title, cls)))
+            except win32gui.error:
+                pass
+            return True
+
+        win32gui.EnumWindows(callback, None)
+        return found
+
+    # -- windows and controls
+
+    def exists(self, hwnd):
+        return bool(hwnd) and bool(win32gui.IsWindow(hwnd))
+
+    def visible(self, hwnd):
+        return self.exists(hwnd) and bool(win32gui.IsWindowVisible(hwnd))
+
+    def enabled(self, hwnd):
+        return self.visible(hwnd) and bool(win32gui.IsWindowEnabled(hwnd))
+
+    def window_title(self, hwnd):
+        try:
+            return win32gui.GetWindowText(hwnd)
+        except win32gui.error:
+            return ""
+
+    def child(self, parent, control_id):
+        found = []
+
+        def callback(hwnd, _):
+            try:
+                if win32gui.GetDlgCtrlID(hwnd) == control_id:
+                    found.append(hwnd)
+            except win32gui.error:
+                pass
+            return True
+
+        try:
+            win32gui.EnumChildWindows(parent, callback, None)
+        except win32gui.error:
+            pass
+        visible = [h for h in found if win32gui.IsWindowVisible(h)]
+        return (visible or found or [None])[0]
+
+    def text(self, hwnd):
+        try:
+            return handleprops.text(hwnd) or ""
+        except Exception:
+            return ""
+
+    def checked(self, hwnd):
+        try:
+            _, value = win32gui.SendMessageTimeout(
+                hwnd, win32con.BM_GETCHECK, 0, 0, win32con.SMTO_ABORTIFHUNG, 2000)
+            return value == win32con.BST_CHECKED
+        except win32gui.error:
+            return False
+
+    def _top(self, hwnd):
+        return int(self._user32.GetAncestor(hwnd, 2) or hwnd)
+
+    def _no_input(self, what):
+        raise StepError("background", f"{what} needs the mouse/keyboard; background mode never uses them.")
+
+    def ensure_shown(self):
+        """Owned dialogs are hidden while PM is minimized: restore it without activating."""
+        if win32gui.IsIconic(self.main):
+            win32gui.ShowWindow(self.main, win32con.SW_SHOWNOACTIVATE)
+            log("PM was minimized: restored without taking focus.")
+            time.sleep(0.5)
+
+    def focus(self, hwnd):
+        if background_mode():
+            return
+        try:
+            HwndWrapper(hwnd).set_focus()
+        except Exception:
+            pass
+
+    def _style(self, hwnd):
+        return win32gui.GetWindowLong(hwnd, win32con.GWL_STYLE)
+
+    def _siblings(self, hwnd):
+        parent = win32gui.GetParent(hwnd)
+        out = []
+        child = win32gui.GetWindow(parent, win32con.GW_CHILD)
+        while child:
+            out.append(child)
+            child = win32gui.GetWindow(child, win32con.GW_HWNDNEXT)
+        return out
+
+    def _radio_group(self, hwnd):
+        """Radio buttons of hwnd's group (a group starts at a control with WS_GROUP)."""
+        siblings = self._siblings(hwnd)
+        index = siblings.index(hwnd)
+        start = index
+        while start > 0 and not self._style(siblings[start]) & win32con.WS_GROUP:
+            start -= 1
+        end = index + 1
+        while end < len(siblings) and not self._style(siblings[end]) & win32con.WS_GROUP:
+            end += 1
+        return [h for h in siblings[start:end]
+                if win32gui.GetClassName(h).casefold() == "button"
+                and self._style(h) & BS_TYPEMASK in RADIO_STYLES]
+
+    def _send(self, hwnd, message, wparam=0, lparam=0):
+        return win32gui.SendMessageTimeout(hwnd, message, wparam, lparam,
+                                           win32con.SMTO_ABORTIFHUNG, 3000)[1]
+
+    def click(self, hwnd):
+        """Background: tell the dialog the button was clicked (WM_COMMAND/BN_CLICKED).
+
+        Posted, never sent, so a handler that opens a modal dialog cannot block us.
+        Mouse mode: physical click in the middle of the control (v2 behaviour).
+        """
+        if not background_mode():
+            self.focus(self._top(hwnd))
+            HwndWrapper(hwnd).click_input()
+            time.sleep(0.2)
+            return
+        cls = win32gui.GetClassName(hwnd).casefold()
+        if "button" not in cls:
+            self._no_input(f"Clicking a '{cls}' control")
+        button_type = self._style(hwnd) & BS_TYPEMASK
+        if button_type in RADIO_STYLES:
+            for radio in self._radio_group(hwnd):
+                self._send(radio, win32con.BM_SETCHECK,
+                           win32con.BST_CHECKED if radio == hwnd else win32con.BST_UNCHECKED)
+        elif button_type in CHECKBOX_STYLES:
+            checked = self.checked(hwnd)
+            self._send(hwnd, win32con.BM_SETCHECK,
+                       win32con.BST_UNCHECKED if checked else win32con.BST_CHECKED)
+        control_id = win32gui.GetDlgCtrlID(hwnd) & 0xFFFF
+        win32gui.PostMessage(win32gui.GetParent(hwnd), win32con.WM_COMMAND,
+                             (BN_CLICKED << 16) | control_id, hwnd)
+        time.sleep(0.2)
+
+    def set_text(self, hwnd, value):
+        HwndWrapper(hwnd).set_edit_text(str(value))    # EM_SETSEL + EM_REPLACESEL, no focus
+
+    def type_text(self, hwnd, value):
+        if background_mode():
+            self._no_input("Typing into a field")
+        self.click(hwnd)
+        send_keys("{HOME}+{END}{DEL}")
+        send_keys(escape_keys(value), with_spaces=True)
+
+    def post_command(self, command_id):
+        win32gui.PostMessage(self.main, win32con.WM_COMMAND, int(command_id) & 0xFFFF, 0)
+
+    def rect(self, hwnd):
+        return win32gui.GetWindowRect(hwnd)
+
+    def date_set(self, hwnd, value):
+        """Set a date/time picker (DTM_SETSYSTEMTIME, no mouse) and notify the dialog."""
+        HwndWrapper(hwnd).set_time(year=value.year, month=value.month, day_of_week=value.isoweekday() % 7,
+                                   day=value.day, hour=value.hour, minute=value.minute)
+        if NOTIFY_DATE_CHANGE:
+            self._notify_date_change(hwnd, value)
+
+    def date_get(self, hwnd):
+        st = HwndWrapper(hwnd).get_time()
+        return datetime(st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute)
+
+    def _notify_date_change(self, hwnd, value):
+        """WM_NOTIFY / DTN_DATETIMECHANGE, laid out for PM's bitness, in PM's own memory."""
+        parent = win32gui.GetParent(hwnd)
+        control_id = win32gui.GetDlgCtrlID(hwnd)
+        st = (value.year, value.month, value.isoweekday() % 7, value.day, value.hour, value.minute, 0, 0)
+        if handleprops.is64bitprocess(self.pid):
+            data = struct.pack("<QQi4xI8H4x", hwnd, control_id, DTN_DATETIMECHANGE, 0, *st)
+        else:
+            data = struct.pack("<IIiI8H", hwnd & 0xFFFFFFFF, control_id, DTN_DATETIMECHANGE, 0, *st)
+        remote = RemoteMemoryBlock(HwndWrapper(hwnd), size=len(data) + 16)
+        try:
+            remote.Write(ctypes.create_string_buffer(data, len(data)))
+            win32gui.SendMessageTimeout(parent, win32con.WM_NOTIFY, control_id, remote.mem_address,
+                                        win32con.SMTO_ABORTIFHUNG, 3000)
+        finally:
+            del remote
+
+    def list_items_levels(self, popup_hwnd):
+        """(text, left) of each list item, e.g. System Messages; left gives the indent level."""
+        try:
+            return [(i.window_text().strip(), i.rectangle().left)
+                    for i in self._uia(popup_hwnd).descendants(control_type="ListItem")
+                    if i.window_text().strip()]
+        except Exception:
+            return []
+
+    def control_colors(self, hwnd):
+        """Colours of a control, read from PM's own rendering (PrintWindow: no focus, works when covered)."""
+        user32, gdi32 = ctypes.windll.user32, ctypes.windll.gdi32
+        vp = ctypes.c_void_p
+        for fn, args, res in ((user32.GetWindowDC, [vp], vp), (user32.ReleaseDC, [vp, vp], ctypes.c_int),
+                              (user32.PrintWindow, [vp, vp, ctypes.c_uint], ctypes.c_int),
+                              (gdi32.CreateCompatibleDC, [vp], vp),
+                              (gdi32.CreateCompatibleBitmap, [vp, ctypes.c_int, ctypes.c_int], vp),
+                              (gdi32.SelectObject, [vp, vp], vp), (gdi32.DeleteObject, [vp], ctypes.c_int),
+                              (gdi32.DeleteDC, [vp], ctypes.c_int),
+                              (gdi32.GetDIBits, [vp, vp, ctypes.c_uint, ctypes.c_uint, vp, vp, ctypes.c_uint],
+                               ctypes.c_int)):
+            fn.argtypes, fn.restype = args, res
+        left, top, right, bottom = win32gui.GetWindowRect(self.main)
+        width, height = right - left, bottom - top
+        window_dc = user32.GetWindowDC(self.main)
+        memory_dc = gdi32.CreateCompatibleDC(window_dc)
+        bitmap = gdi32.CreateCompatibleBitmap(window_dc, width, height)
+        previous = gdi32.SelectObject(memory_dc, bitmap)
+        try:
+            if not user32.PrintWindow(self.main, memory_dc, 2):      # PW_RENDERFULLCONTENT
+                user32.PrintWindow(self.main, memory_dc, 0)
+            header = (ctypes.c_int32 * 10)(40, width, -height, 0x00200001, 0, 0, 0, 0, 0, 0)  # 32bpp, planes 1
+            buf = ctypes.create_string_buffer(width * height * 4)
+            gdi32.GetDIBits(memory_dc, bitmap, 0, height, buf, header, 0)
+            raw = buf.raw
+        finally:
+            gdi32.SelectObject(memory_dc, previous)
+            gdi32.DeleteObject(bitmap)
+            gdi32.DeleteDC(memory_dc)
+            user32.ReleaseDC(self.main, window_dc)
+        l, t, r, b = win32gui.GetWindowRect(hwnd)
+        return region_colors((width, height, raw), l - left, t - top, r - left, b - top)
+
+    def combo_items(self, hwnd):
+        return list(HwndWrapper(hwnd).item_texts())
+
+    def combo_select(self, hwnd, text):
+        combo = HwndWrapper(hwnd)
+        combo.select(combo.item_texts().index(text))   # exact match, never fuzzy
+
+    def combo_selected(self, hwnd):
+        combo = HwndWrapper(hwnd)
+        index = combo.selected_index()
+        items = combo.item_texts()
+        return items[index] if 0 <= index < len(items) else ""
+
+    def describe(self, hwnd):
+        texts = []
+
+        def callback(child, _):
+            try:
+                cls = win32gui.GetClassName(child)
+                if cls in ("Static", "Button") and win32gui.IsWindowVisible(child):
+                    text = self.text(child).strip()
+                    if text:
+                        texts.append(text)
+            except win32gui.error:
+                pass
+            return True
+
+        try:
+            win32gui.EnumChildWindows(hwnd, callback, None)
+        except win32gui.error:
+            pass
+        cls = win32gui.GetClassName(hwnd) if self.exists(hwnd) else "?"
+        return f"'{self.window_title(hwnd)}' class={cls} hwnd={hwnd} texts={texts[:12]}"
+
+    # -- UIA-only parts of PM
+
+    def _uia(self, hwnd):
+        return Desktop(backend="uia").window(handle=hwnd).wrapper_object()
+
+    def _uia_invoke(self, root_hwnd, name, control_type):
+        """Invoke a UIA element in a worker thread (no mouse).
+
+        PM may run the command synchronously and keep the call blocked while the
+        dialog it opened is shown, so the worker is left waiting and the runner
+        continues; the result is judged by the pre/post checks.
+        """
+        outcome = {}
+
+        def work():
+            try:
+                import pythoncom
+                pythoncom.CoInitializeEx(pythoncom.COINIT_MULTITHREADED)
+            except Exception:
+                pass
+            try:
+                target = None
+                for element in self._uia(root_hwnd).descendants(control_type=control_type):
+                    if element.window_text().strip() == name:
+                        target = element
+                        break
+                if target is None:
+                    outcome["missing"] = True
+                    return
+                outcome["found"] = True
+                try:
+                    target.invoke()
+                except Exception:
+                    uia_defines.get_elem_interface(
+                        target.element_info.element, "LegacyIAccessible").DoDefaultAction()
+                outcome["returned"] = True
+            except Exception as exc:
+                outcome["error"] = exc
+
+        worker = threading.Thread(target=work, daemon=True)
+        worker.start()
+        worker.join(T_UIA_INVOKE)
+        if "error" in outcome:
+            raise outcome["error"]
+        if outcome.get("missing"):
+            return False
+        if not outcome.get("found"):
+            raise StepError("uia", f"UIA lookup of '{name}' did not finish within {T_UIA_INVOKE}s.")
+        return True
+
+    def click_ribbon_find(self):
+        if background_mode():
+            if FIND_PLAYER_COMMAND_ID:
+                self.post_command(FIND_PLAYER_COMMAND_ID)
+                return True
+            return self._uia_invoke(self.main, FIND_RIBBON_BUTTON, "Button")
+        self.focus(self.main)
+        for button in self._uia(self.main).descendants(control_type="Button"):
+            if button.window_text().strip() == FIND_RIBBON_BUTTON:
+                button.click_input()
+                return True
+        return False
+
+    def send_find_shortcut(self):
+        if background_mode():
+            self._no_input(f"Shortcut {FIND_SHORTCUT}")
+        self.focus(self.main)
+        send_keys(FIND_SHORTCUT)
+
+    def click_named_item(self, popup_hwnd, name, control_type):
+        if background_mode():
+            return self._uia_invoke(popup_hwnd, name, control_type)
+        for item in self._uia(popup_hwnd).descendants(control_type=control_type):
+            if item.window_text().strip() == name:
+                item.click_input()
+                return True
+        return False
+
+    def click_menu_item(self, popup_hwnd, name):
+        if self.click_named_item(popup_hwnd, name, "MenuItem"):
+            return True
+        if background_mode():
+            return False
+        # Fallback: recorded position of "Redeem Coupon..." in the 244x380 Options menu.
+        left, top, right, bottom = win32gui.GetWindowRect(popup_hwnd)
+        if name == REDEEM_MENU_ITEM and (right - left, bottom - top) == (244, 380):
+            mouse.click(button="left", coords=(left + 122, top + 233))
+            return True
+        return False
+
+    def list_items(self, popup_hwnd):
+        try:
+            return [clean for clean in (i.window_text().strip() for i in
+                    self._uia(popup_hwnd).descendants(control_type="ListItem")) if clean]
+        except Exception:
+            return []
+
+    def mdi_active(self):
+        client = win32gui.FindWindowEx(self.main, 0, "MDIClient", None)
+        if not client:
+            return 0
+        try:
+            _, active = win32gui.SendMessageTimeout(
+                client, WM_MDIGETACTIVE, 0, 0, win32con.SMTO_ABORTIFHUNG, 2000)
+            return int(active or 0)
+        except win32gui.error:
+            return 0
+
+    def close_tab(self, hwnd):
+        win32gui.PostMessage(hwnd, win32con.WM_SYSCOMMAND, win32con.SC_CLOSE, 0)
+
+    def _children(self, hwnd):
+        found = []
+        try:
+            win32gui.EnumChildWindows(hwnd, lambda h, _: found.append(h) or True, None)
+        except win32gui.error:
+            pass
+        return found
+
+    def fill_login(self, hwnd, username, password):
+        if background_mode():
+            return self._fill_login_background(hwnd, username, password)
+        self.focus(hwnd)
+        window = self._uia(hwnd)
+        edits = [e for e in window.descendants(control_type="Edit") if e.is_visible() and e.is_enabled()]
+
+        def is_password(edit):
+            try:
+                return bool(edit.element_info.element.CurrentIsPassword)
+            except Exception:
+                return False
+
+        passwords = [e for e in edits if is_password(e)]
+        others = [e for e in edits if not is_password(e)]
+        if passwords and others:
+            user_ctl, password_ctl = others[0], passwords[0]
+        elif len(edits) >= 2:
+            user_ctl, password_ctl = edits[0], edits[1]
+        else:
+            raise StepError("0_login", "Could not identify separate Username and Password fields.")
+        for control, value in ((user_ctl, username), (password_ctl, password)):
+            control.click_input()
+            send_keys("{HOME}+{END}{DEL}")
+            send_keys(escape_keys(value), with_spaces=True)
+        typed_user = ""
+        try:
+            typed_user = user_ctl.get_value() or ""
+        except Exception:
+            typed_user = username
+        if typed_user.strip() != username.strip():
+            raise StepError("0_login", "Username field does not show the configured username.")
+        buttons = [b for b in window.descendants(control_type="Button")
+                   if b.window_text().strip().casefold() in LOGIN_BUTTON_NAMES and b.is_enabled()]
+        if buttons:
+            buttons[0].click_input()
+        else:
+            send_keys("{ENTER}")
+
+    def _fill_login_background(self, hwnd, username, password):
+        edits = [h for h in self._children(hwnd)
+                 if "edit" in win32gui.GetClassName(h).casefold() and self.enabled(h)]
+        passwords = [h for h in edits if self._style(h) & win32con.ES_PASSWORD]
+        others = sorted((h for h in edits if h not in passwords),
+                        key=lambda h: win32gui.GetWindowRect(h)[1])
+        if not passwords or not others:
+            raise StepError("0_login", "Could not identify separate Username and Password fields.")
+        user_ctl, password_ctl = others[0], passwords[0]
+        HwndWrapper(user_ctl).set_edit_text(username)
+        HwndWrapper(password_ctl).set_edit_text(password)
+        if self.text(user_ctl).strip() != username.strip():
+            raise StepError("0_login", "Username field does not show the configured username.")
+        for name in ("Login", "Log In", "Logon", "Log On", "Sign In", "OK"):
+            if self._uia_invoke(hwnd, name, "Button"):
+                return
+        raise StepError("0_login", "Login button not found.")
+
+
+# ------------------------------------------------------ gates (pre/post)
+
+def read_state(pm):
+    ensure_shown = getattr(pm, "ensure_shown", None)
+    if ensure_shown:
+        ensure_shown()
+    return PMState(pm.main_title(), pm.main_enabled(), pm.popups())
+
+
+def state_problem(state, popups, main_enabled, player_id):
+    expected = sorted(popups)
+    if state.kinds() != expected:
+        return f"expected popups {expected or 'none'}, found {state.kinds() or 'none'}"
+    if main_enabled is not None and state.main_enabled != main_enabled:
+        return f"expected main window {'enabled' if main_enabled else 'blocked'}"
+    if player_id is not None and not title_has_player(state.title, player_id):
+        return f"main title does not show player {player_id}: '{state.title}'"
+    return None
+
+
+def raise_on_unknown(pm, step, state, while_doing):
+    unknown = [p for p in state.popups if p.kind == UNKNOWN]
+    if unknown:
+        raise StepError(step, f"unexpected popup while {while_doing}: {pm.describe(unknown[0].hwnd)}")
+
+
+def check_state(pm, step, popups=(), main_enabled=None, player_id=None):
+    """Pre-check: PM must already be in this state, otherwise stop."""
+    state = read_state(pm)
+    raise_on_unknown(pm, step, state, "checking the state before this step")
+    problem = state_problem(state, popups, main_enabled, player_id)
+    if problem:
+        raise StepError(step, f"pre-check failed: {problem}. State: {state.summary()}")
+    log(f"  [{step}] pre-check OK   {state.summary()}")
+    return state
+
+
+def wait_state(pm, step, popups=(), main_enabled=None, player_id=None,
+               timeout=T_VERIFY, quiet=0.0, what="the expected state", fail=True):
+    """Post-check: wait until PM reaches this state (stable for `quiet` seconds)."""
+    deadline = time.time() + timeout
+    stable_since = None
+    problem = "not checked yet"
+    while True:
+        state = read_state(pm)
+        raise_on_unknown(pm, step, state, f"waiting for {what}")
+        problem = state_problem(state, popups, main_enabled, player_id)
+        if problem is None:
+            stable_since = stable_since or time.time()
+            if time.time() - stable_since >= quiet:
+                log(f"  [{step}] post-check OK  {state.summary()}")
+                return state
+        else:
+            stable_since = None
+        if time.time() > deadline:
+            if not fail:
+                return None
+            raise StepError(step, f"timed out after {timeout}s waiting for {what}: {problem}. "
+                                  f"State: {state.summary()}")
+        time.sleep(POLL)
+
+
+def wait_until(predicate, timeout, interval=POLL):
+    deadline = time.time() + timeout
+    while True:
+        try:
+            if predicate():
+                return True
+        except Exception:
+            pass
+        if time.time() > deadline:
+            return False
+        time.sleep(interval)
+
+
+def wait_popup_closed(pm, step, popup, timeout=T_POPUP_CLOSE):
+    deadline = time.time() + timeout
+    while pm.visible(popup.hwnd):
+        state = read_state(pm)
+        raise_on_unknown(pm, step, state, f"waiting for {popup.kind} to close")
+        if time.time() > deadline:
+            raise StepError(step, f"{popup.label()} did not close within {timeout}s. State: {state.summary()}")
+        time.sleep(POLL)
+    log(f"  [{step}] {popup.kind} closed")
+
+
+def control(pm, step, popup, control_id, what, need_enabled=True, timeout=T_VERIFY):
+    found = {}
+
+    def ready():
+        hwnd = pm.child(popup.hwnd, control_id)
+        found["hwnd"] = hwnd
+        return hwnd and (pm.enabled(hwnd) if need_enabled else pm.exists(hwnd))
+
+    if not wait_until(ready, timeout):
+        state = "missing" if not found.get("hwnd") else "disabled"
+        raise StepError(step, f"{what} (id={control_id}) in {popup.label()} is {state}.")
+    return found["hwnd"]
+
+
+def click(pm, step, popup, control_id, what, allow_ok=False):
+    allowed = {COUPON: COUPON_CLICKABLE_IDS, ADJUST: ADJUST_CLICKABLE_IDS}.get(popup.kind)
+    if allowed is not None and control_id not in allowed | ({ID_OK} if allow_ok else set()):
+        raise StepError(step, f"Safety stop: refusing to click control id={control_id} in {popup.title}.")
+    hwnd = control(pm, step, popup, control_id, what)
+    log(f"  [{step}] click {what} (id={control_id})")
+    pm.click(hwnd)
+    return hwnd
+
+
+def set_and_verify(pm, step, hwnd, value, what, numeric=False):
+    norm = normalized_number_text if numeric else (lambda v: str(v).strip())
+    expected = norm(value)
+
+    def matches():
+        return norm(pm.text(hwnd)) == expected
+
+    pm.set_text(hwnd, value)
+    if not wait_until(matches, 1.5):
+        if background_mode():
+            raise StepError(step, f"{what} shows '{pm.text(hwnd)}', expected '{expected}'.")
+        log(f"  [{step}] {what}: direct set did not stick, typing instead")
+        pm.type_text(hwnd, value)
+        if not wait_until(matches, T_VERIFY):
+            raise StepError(step, f"{what} shows '{pm.text(hwnd)}', expected '{expected}'.")
+    log(f"  [{step}] checkpoint: {what} = {expected}")
+
+
+# ----------------------------------------------------------------- steps
+
+def ensure_logged_in(pm, username, password):
+    step = "0_login"
+    state = read_state(pm)
+    if state.get(LOGIN) is None and state.title.startswith("Patron Management - "):
+        log("PM is already logged in.")
+        return
+    if state.get(LOGIN) is None:
+        log("Waiting for the PM login window...")
+        state = wait_state(pm, step, popups=(LOGIN,), timeout=30, what="the login window")
+    if (not username or not password or username == "ENTER_USERNAME_HERE"
+            or password == "ENTER_PASSWORD_HERE"):
+        raise StepError(step, "Fill in pm_credentials.py first.")
+    login_window = check_state(pm, step, popups=(LOGIN,)).get(LOGIN)
+    log(f"  [{step}] typing credentials into {login_window.label()}")
+    pm.fill_login(login_window.hwnd, username, password)
+    deadline = time.time() + T_LOGIN
+    while True:
+        state = read_state(pm)
+        raise_on_unknown(pm, step, state, "logging in")
+        if (state.get(LOGIN) is None and not state.popups and state.main_enabled
+                and state.title.startswith("Patron Management - ")):
+            break
+        if time.time() > deadline:
+            raise StepError(step, f"login did not finish within {T_LOGIN}s. State: {state.summary()}")
+        time.sleep(POLL)
+    wait_state(pm, step, popups=(), main_enabled=True, quiet=QUIET_SECONDS, timeout=10,
+               what="PM idle after login")
+    log("Login completed.")
+
+
+def open_find_player(pm, step):
+    check_state(pm, step, popups=(), main_enabled=True)
+    clicked = False
+    try:
+        log(f"  [{step}] click Ribbon '{FIND_RIBBON_BUTTON}'")
+        clicked = pm.click_ribbon_find()
+    except Exception as exc:
+        log(f"  [{step}] Ribbon click failed: {exc}")
+    if clicked:
+        state = wait_state(pm, step, popups=(FIND,), main_enabled=False, timeout=T_FIND_OPEN,
+                           what="Find a Player", fail=False)
+        if state:
+            return state
+    state = read_state(pm)
+    if state.popups or not state.main_enabled:
+        # Something is already opening; do not send a second command.
+        return wait_state(pm, step, popups=(FIND,), main_enabled=False, timeout=T_FIND_OPEN,
+                          what="Find a Player")
+    if background_mode():
+        raise StepError(step, "Find a Player did not open from the Ribbon button (background mode). "
+                              "Set FIND_PLAYER_COMMAND_ID or use CONTROL_MODE = 'mouse'.")
+    log(f"  [{step}] fallback: shortcut {FIND_SHORTCUT}")
+    pm.send_find_shortcut()
+    return wait_state(pm, step, popups=(FIND,), main_enabled=False, timeout=T_FIND_OPEN,
+                      what="Find a Player")
+
+
+def wait_profile_title(pm, step, player_id, previous_title, previous_tab):
+    """Wait for the new profile; the old title stays for ~4-5s and is not an error.
+
+    When this player was already on screen the title cannot show the reload, so
+    wait for a new profile tab, or SAME_PLAYER_WAIT_SECONDS if PM reuses the tab.
+    """
+    started = time.time()
+    deadline = started + T_PROFILE_LOAD
+    same_player = title_has_player(previous_title, player_id)
+    while True:
+        state = read_state(pm)
+        raise_on_unknown(pm, step, state, "waiting for the profile to load")
+        others = [p for p in state.popups if p.kind not in (SYSMSG, COMMENT)]
+        if others:
+            raise StepError(step, f"unexpected popup while loading the profile: {others[0].label()}")
+        if title_has_player(state.title, player_id):
+            tab = pm.mdi_active()
+            if not same_player or (tab and tab != previous_tab):
+                log(f"  [{step}] post-check OK  profile loaded: '{state.title}'")
+                return state
+            if time.time() - started >= SAME_PLAYER_WAIT_SECONDS:
+                log(f"  [{step}] post-check OK  same player was already open; "
+                    f"waited {SAME_PLAYER_WAIT_SECONDS:.0f}s for the reload")
+                return state
+        if state.title != previous_title and ids_in_title(state.title):
+            raise StepError(step, f"Wrong profile opened for {player_id}: '{state.title}'")
+        if time.time() > deadline:
+            raise StepError(step, f"profile {player_id} did not load within {T_PROFILE_LOAD}s. "
+                                  f"State: {state.summary()}")
+        time.sleep(POLL)
+
+
+def summarize_messages(items):
+    """System Messages lines as 'Title (description)'; the smallest indent is a group header."""
+    if not items:
+        return [], []
+    levels = sorted({left for _, left in items})
+    title_level = levels[1] if len(levels) > 2 else levels[0]
+    messages, current = [], None
+    for text, left in items:
+        if left < title_level:
+            continue                      # group header such as "Player Stop Codes"
+        if left == title_level:
+            current = [text, ""]
+            messages.append(current)
+        elif current:
+            current[1] = (current[1] + " " + text).strip()
+    return [f"{t} ({d})" if d else t for t, d in messages], [t for t, _ in messages]
+
+
+def handle_system_messages(pm, step, popup):
+    items = pm.list_items_levels(popup.hwnd)
+    lines, titles = summarize_messages(items)
+    log(f"  [{step}] System Messages: {' | '.join(lines) or '(no readable items)'} (logged only)")
+    click(pm, step, popup, SYSMSG_CLOSE, "System Messages Close")
+    wait_popup_closed(pm, step, popup)
+    return lines, titles
+
+
+def comment_signature(pm, popup, next_hwnd, close_hwnd):
+    header = pm.child(popup.hwnd, COMMENT_HEADER)
+    previous = pm.child(popup.hwnd, COMMENT_PREVIOUS)
+    return (pm.text(header) if header else "", pm.enabled(next_hwnd),
+            pm.enabled(previous) if previous else None, pm.enabled(close_hwnd))
+
+
+def handle_player_comment(pm, step, popup):
+    """Close is disabled until the last comment has been shown: page with Next first."""
+    next_hwnd = control(pm, step, popup, COMMENT_NEXT, "Player Comment Next", need_enabled=False)
+    close_hwnd = control(pm, step, popup, COMMENT_CLOSE, "Player Comment Close", need_enabled=False)
+    page = 1
+    while True:
+        if pm.enabled(close_hwnd):
+            log(f"  [{step}] Player Comment: all {page} page(s) shown, Close is enabled")
+            click(pm, step, popup, COMMENT_CLOSE, "Player Comment Close")
+            wait_popup_closed(pm, step, popup)
+            return page
+        if page >= MAX_COMMENT_PAGES:
+            raise StepError(step, f"Player Comment still not closable after {page} pages.")
+        if pm.enabled(next_hwnd):
+            before = comment_signature(pm, popup, next_hwnd, close_hwnd)
+            for attempt in (1, 2):
+                log(f"  [{step}] Player Comment: click Next (page {page} -> {page + 1})")
+                pm.click(next_hwnd)
+                if wait_until(lambda: comment_signature(pm, popup, next_hwnd, close_hwnd) != before,
+                              T_COMMENT_PAGE):
+                    break
+                if attempt == 2:
+                    raise StepError(step, "Player Comment did not react to Next.")
+            page += 1
+            continue
+        # Next can be hidden for ~0.1s while PM redraws it.
+        if not wait_until(lambda: pm.enabled(close_hwnd) or pm.enabled(next_hwnd), 2.0):
+            raise StepError(step, "Player Comment: Next and Close are both disabled.")
+
+
+def settle_profile(pm, step, player_id, quiet):
+    """Handle System Messages / Player Comment until PM stays idle for `quiet` seconds."""
+    deadline = time.time() + T_PROFILE_POPUPS
+    quiet_since = None
+    messages, codes, pages = [], [], 0
+    while True:
+        state = read_state(pm)
+        raise_on_unknown(pm, step, state, "handling profile popups")
+        if not title_has_player(state.title, player_id):
+            raise StepError(step, f"profile title changed unexpectedly: '{state.title}'")
+        others = [p for p in state.popups if p.kind not in (SYSMSG, COMMENT)]
+        if others:
+            raise StepError(step, f"unexpected popup on the profile: {others[0].label()}")
+        if state.get(SYSMSG):
+            lines, titles = handle_system_messages(pm, step, state.get(SYSMSG))
+            messages.extend(lines)
+            codes.extend(titles)
+            quiet_since = None
+        elif state.get(COMMENT):
+            pages += handle_player_comment(pm, step, state.get(COMMENT))
+            quiet_since = None
+        elif not state.main_enabled:
+            quiet_since = None      # a modal popup is being created (shows 0.03-0.25s later)
+        else:
+            quiet_since = quiet_since or time.time()
+            if time.time() - quiet_since >= quiet:
+                log(f"  [{step}] post-check OK  profile idle for {quiet:.1f}s  {state.summary()}")
+                return messages, codes, pages
+        if time.time() > deadline:
+            raise StepError(step, f"profile did not become idle within {T_PROFILE_POPUPS}s. "
+                                  f"State: {state.summary()}")
+        time.sleep(POLL)
+
+
+def read_identification(pm, step, tab):
+    """Text and colour of the player name in the Identification frame (by control ID)."""
+    frame = pm.child(tab, IDENT_FRAME_ID)
+    name = pm.child(tab, IDENT_NAME_ID)
+    if not frame or not name or not pm.visible(name):
+        raise StepError(step, f"Identification name (id {IDENT_NAME_ID}) not found on the profile tab.")
+    if pm.text(frame).strip() != "Identification":
+        raise StepError(step, f"control {IDENT_FRAME_ID} is '{pm.text(frame)}', expected frame 'Identification'.")
+    fl, ft, fr, fb = pm.rect(frame)
+    nl, nt, nr, nb = pm.rect(name)
+    if not (fl <= nl and nr <= fr and ft <= nt and nb <= fb):
+        raise StepError(step, f"control {IDENT_NAME_ID} is not inside the Identification frame.")
+    text = pm.text(name).strip()
+    if not text:
+        raise StepError(step, "Identification name is empty.")
+    try:
+        colors = pm.control_colors(name) or {}
+    except Exception as exc:
+        log(f"  [{step}] colour not readable: {exc}")
+        colors = {}
+    return text, colors
+
+
+def active_profile_tab(pm, step, player_id):
+    tab = pm.mdi_active()
+    title = pm.window_title(tab) if tab else ""
+    if not tab or not title_has_player(title, player_id):
+        raise StepError(step, f"active profile tab is not player {player_id}: '{title}'")
+    return tab
+
+
+def select_combo(pm, step, combo_hwnd, value, what):
+    items = pm.combo_items(combo_hwnd)
+    if value not in items:
+        raise StepError(step, f"'{value}' is not in the {what} list ({len(items)} items).")
+    log(f"  [{step}] select '{value}' in {what}")
+    try:
+        pm.combo_select(combo_hwnd, value)
+    except Exception as exc:
+        log(f"  [{step}] direct select failed: {exc}")
+    if wait_until(lambda: pm.combo_selected(combo_hwnd) == value, T_VERIFY):
+        return
+    if background_mode():
+        raise StepError(step, f"{what} shows '{pm.combo_selected(combo_hwnd)}', expected '{value}'.")
+    log(f"  [{step}] fallback: open the list and click the item")
+    popup_kind = read_state(pm).popups[0].kind
+    pm.click(combo_hwnd)
+    state = wait_state(pm, step, popups=(popup_kind, DROPDOWN), timeout=T_VERIFY, what=f"the {what} list")
+    if not pm.click_named_item(state.get(DROPDOWN).hwnd, value, "ListItem"):
+        raise StepError(step, f"'{value}' not found in the open {what} list.")
+    wait_state(pm, step, popups=(popup_kind,), timeout=T_VERIFY, what=f"the {what} list to close")
+    if not wait_until(lambda: pm.combo_selected(combo_hwnd) == value, T_VERIFY):
+        raise StepError(step, f"{what} shows '{pm.combo_selected(combo_hwnd)}', expected '{value}'.")
+
+
+def money(text):
+    cleaned = re.sub(r"[^0-9.\-]", "", str(text))
+    return float(cleaned) if cleaned not in ("", "-", ".") else None
+
+
+def inside(outer, inner, tolerance=4):
+    """inner rectangle within outer (group box borders may be a few pixels off)."""
+    return (outer[0] - tolerance <= inner[0] and inner[2] <= outer[2] + tolerance
+            and outer[1] - tolerance <= inner[1] and inner[3] <= outer[3] + tolerance)
+
+
+def begin_step(progress, name):
+    """Pause STEP_DELAY_SECONDS before every step, then record the step name."""
+    time.sleep(STEP_DELAY_SECONDS)
+    progress["step"] = name
+    return name
+
+
+def open_profile(pm, job, progress):
+    """Steps 1-6b, common to every workflow: find the player and make sure it may be processed."""
+    player_id = job["player_id"]
+
+    step = begin_step(progress, "1_precheck_idle")
+    state = check_state(pm, step, popups=(), main_enabled=True)
+    if not state.title.startswith("Patron Management - "):
+        raise StepError(step, f"PM is not on a logged-in page: '{state.title}'")
+    open_tab = pm.mdi_active()
+    if open_tab and title_has_player(pm.window_title(open_tab), player_id):
+        # Same player as the previous job: close its tab so Find opens a fresh profile.
+        log(f"  [{step}] profile of {player_id} is still open, closing that tab first")
+        pm.close_tab(open_tab)
+        if not wait_until(lambda: not pm.exists(open_tab) or not pm.visible(open_tab), T_TAB_CLOSE):
+            raise StepError(step, f"tab of {player_id} did not close. State: {read_state(pm).summary()}")
+        state = wait_state(pm, step, popups=(), main_enabled=True, timeout=T_TAB_CLOSE, quiet=0.5,
+                           what="PM idle after closing the tab")
+    previous_title = state.title
+    previous_tab = pm.mdi_active()
+
+    step = begin_step(progress, "2_open_find_player")
+    open_find_player(pm, step)
+
+    step = begin_step(progress, "3_enter_player_id")
+    find = check_state(pm, step, popups=(FIND,), main_enabled=False).get(FIND)
+    field = control(pm, step, find, FIND_PLAYER_ID_EDIT, "Player ID field")
+    set_and_verify(pm, step, field, player_id, "Player ID")
+
+    step = begin_step(progress, "4_confirm_find")
+    find = check_state(pm, step, popups=(FIND,), main_enabled=False).get(FIND)
+    if pm.text(field).strip() != player_id:
+        raise StepError(step, f"Player ID field changed to '{pm.text(field)}' before OK.")
+    click(pm, step, find, ID_OK, "Find a Player OK")
+    wait_popup_closed(pm, step, find, T_FIND_CLOSE)
+
+    step = begin_step(progress, "5_wait_profile_loaded")
+    wait_profile_title(pm, step, player_id, previous_title, previous_tab)
+
+    step = begin_step(progress, "6_profile_popups")
+    messages, codes, pages = settle_profile(pm, step, player_id, QUIET_SECONDS)
+    progress["tab"] = active_profile_tab(pm, step, player_id)
+    progress["system_messages"] = " | ".join(messages)
+    progress["stop_codes"] = ", ".join(codes)
+    progress["comment_pages"] = pages
+
+    step = begin_step(progress, "6b_check_identification")
+    check_state(pm, step, popups=(), main_enabled=True, player_id=player_id)
+    name, colors = read_identification(pm, step, active_profile_tab(pm, step, player_id))
+    green = colors.get("background_color") == "green" if colors else None
+    color_text = (f"background {colors.get('background_color')} {colors.get('background_rgb')} "
+                  f"(green background: {'YES' if green else 'no'}), "
+                  f"text {colors.get('text_color')} {colors.get('text_rgb')}") if colors else "colour unknown"
+    progress["identification"] = name
+    progress["name_color"] = color_text
+    log(f"  [{step}] Identification name: '{name}' ({color_text})")
+    if SKIP_NAME_RE.search(name):
+        raise PlayerSkipped("SKIPPED_LOC", f"Identification name '{name}' contains '(Loc:' ({color_text}); "
+                                           "player not processed.")
+    log(f"  [{step}] checkpoint: no '(Loc:' in the name, continue")
+
+
+def finish_dialog(pm, step, job, progress, dialog, allow_ok):
+    """OK (real, recorded in the ledger first) or Cancel (test), then PM must be idle again."""
+    player_id = job["player_id"]
+    if not allow_ok:
+        click(pm, step, dialog, ID_CANCEL, f"{dialog.title} Cancel")
+        wait_popup_closed(pm, step, dialog)
+        wait_state(pm, step, popups=(), main_enabled=True, player_id=player_id,
+                   timeout=T_POPUP_CLOSE, quiet=0.5, what="PM idle after Cancel")
+        return
+    # Written before the click: if anything goes wrong afterwards this job is
+    # still treated as done and is never clicked again by a rerun today.
+    ledger_append(job, "OK_CLICKED")
+    progress["ok_clicked"] = True
+    click(pm, step, dialog, ID_OK, f"{dialog.title} OK", allow_ok=True)
+    wait_popup_closed(pm, step, dialog, T_AFTER_OK)
+    wait_state(pm, step, popups=(), main_enabled=True, player_id=player_id,
+               timeout=T_AFTER_OK, quiet=1.0, what="PM idle after OK")
+    ledger_append(job, "DONE")
+
+
+def run_coupon(pm, job, progress, allow_ok):
+    """Workflows #1 and #3: Options > Redeem Coupon... > Competitor Coupon > competitor > amount."""
+    player_id, amount = job["player_id"], job["amount"]
+    competitor = WORKFLOWS[job["workflow"]]["competitor"]
+
+    step = begin_step(progress, "7_open_options_menu")
+    check_state(pm, step, popups=(), main_enabled=True, player_id=player_id)
+    tab = active_profile_tab(pm, step, player_id)
+    if REDEEM_COUPON_COMMAND_ID:
+        log(f"  [{step}] skipped: Redeem Coupon is sent as command id {REDEEM_COUPON_COMMAND_ID}")
+    else:
+        options = pm.child(tab, OPTIONS_BUTTON)
+        if not options or not pm.enabled(options):
+            raise StepError(step, "Options... button not found or disabled on the active profile tab.")
+        log(f"  [{step}] click Options... (id={OPTIONS_BUTTON})")
+        pm.click(options)
+        wait_state(pm, step, popups=(MENU,), main_enabled=True, player_id=player_id,
+                   timeout=T_MENU_OPEN, what="the Options menu")
+
+    step = begin_step(progress, "8_click_redeem_coupon")
+    if REDEEM_COUPON_COMMAND_ID:
+        check_state(pm, step, popups=(), main_enabled=True, player_id=player_id)
+        active_profile_tab(pm, step, player_id)
+        log(f"  [{step}] post command id {REDEEM_COUPON_COMMAND_ID} (Redeem Coupon...)")
+        pm.post_command(REDEEM_COUPON_COMMAND_ID)
+    else:
+        menu = check_state(pm, step, popups=(MENU,), main_enabled=True, player_id=player_id).get(MENU)
+        log(f"  [{step}] click menu item '{REDEEM_MENU_ITEM}'")
+        if not pm.click_menu_item(menu.hwnd, REDEEM_MENU_ITEM):
+            raise StepError(step, f"Menu item '{REDEEM_MENU_ITEM}' not found.")
+    wait_state(pm, step, popups=(COUPON,), main_enabled=False, player_id=player_id,
+               timeout=T_COUPON_OPEN, what="Coupon Redemption")
+
+    step = begin_step(progress, "9_select_competitor_coupon")
+    coupon = check_state(pm, step, popups=(COUPON,), main_enabled=False, player_id=player_id).get(COUPON)
+    radio = control(pm, step, coupon, COUPON_COMPETITOR_RADIO, "Competitor Coupon")
+    our_radio = control(pm, step, coupon, COUPON_OUR_RADIO, "Our Coupon", need_enabled=False)
+    combo = control(pm, step, coupon, COUPON_COMPETITOR_COMBO, "Competitor list", need_enabled=False)
+    amount_field = control(pm, step, coupon, COUPON_AMOUNT_EDIT, "Amount", need_enabled=False)
+    log(f"  [{step}] initial: Competitor list enabled={pm.enabled(combo)}, Amount enabled={pm.enabled(amount_field)}")
+    click(pm, step, coupon, COUPON_COMPETITOR_RADIO, "Competitor Coupon")
+    if not wait_until(lambda: pm.checked(radio) and not pm.checked(our_radio)
+                      and pm.enabled(combo) and pm.enabled(amount_field), T_FIELDS_ENABLE):
+        raise StepError(step, f"after Competitor Coupon: selected={pm.checked(radio)}, "
+                              f"list enabled={pm.enabled(combo)}, Amount enabled={pm.enabled(amount_field)}")
+    wait_state(pm, step, popups=(COUPON,), main_enabled=False, player_id=player_id,
+               what="Coupon Redemption only")
+    log(f"  [{step}] checkpoint: Competitor Coupon selected, list and Amount enabled")
+
+    step = begin_step(progress, "10_select_competitor")
+    check_state(pm, step, popups=(COUPON,), main_enabled=False, player_id=player_id)
+    select_combo(pm, step, combo, competitor, "Competitor")
+    wait_state(pm, step, popups=(COUPON,), main_enabled=False, player_id=player_id,
+               what="Coupon Redemption only")
+    log(f"  [{step}] checkpoint: Competitor = {competitor}")
+
+    step = begin_step(progress, "11_enter_amount")
+    check_state(pm, step, popups=(COUPON,), main_enabled=False, player_id=player_id)
+    set_and_verify(pm, step, amount_field, amount, "Amount", numeric=True)
+    wait_state(pm, step, popups=(COUPON,), main_enabled=False, player_id=player_id,
+               quiet=0.5, what="no popup after entering the amount")
+
+    step = begin_step(progress, "12_ok_coupon" if allow_ok else "12_cancel_coupon")
+    check_state(pm, step, popups=(COUPON,), main_enabled=False, player_id=player_id)
+    if pm.combo_selected(combo) != competitor or \
+            normalized_number_text(pm.text(amount_field)) != normalized_number_text(amount) or \
+            not pm.checked(radio) or pm.checked(our_radio) or \
+            active_profile_tab(pm, step, player_id) != progress["tab"]:
+        raise StepError(step, "Coupon fields or profile changed before the final click. Nothing was clicked.")
+    log(f"  [{step}] final check OK: player {player_id}, {competitor}, amount {amount}")
+    finish_dialog(pm, step, job, progress, coupon, allow_ok)
+
+
+def run_bbr(pm, job, progress, allow_ok):
+    """Workflows #2 and #4: Rewards BBR > Adjust > Add BBR, amount, expiration, reason, comment."""
+    player_id, amount = job["player_id"], job["amount"]
+    wf = WORKFLOWS[job["workflow"]]
+    expires = expiration_for(job["workflow"], progress["today"])
+    comment = wf["comment"](progress["today"])
+
+    step = begin_step(progress, "7_select_bbr")
+    check_state(pm, step, popups=(), main_enabled=True, player_id=player_id)
+    tab = active_profile_tab(pm, step, player_id)
+    frame, bbr, adjust = (pm.child(tab, REWARDS_FRAME_ID), pm.child(tab, BBR_RADIO), pm.child(tab, ADJUST_BUTTON))
+    if not frame or not bbr or not adjust:
+        raise StepError(step, "Rewards frame, BBR or Adjust not found on the profile tab.")
+    if pm.text(frame).strip() != "Rewards" or pm.text(bbr).replace("&", "").strip() != "BBR" \
+            or pm.text(adjust).replace("&", "").strip() != "Adjust":
+        raise StepError(step, f"unexpected controls: frame '{pm.text(frame)}', radio '{pm.text(bbr)}', "
+                              f"button '{pm.text(adjust)}'.")
+    if not inside(pm.rect(frame), pm.rect(bbr)) or not inside(pm.rect(frame), pm.rect(adjust)):
+        raise StepError(step, "BBR / Adjust are not inside the Rewards frame.")
+    if not pm.checked(bbr):
+        log(f"  [{step}] click BBR (id={BBR_RADIO})")
+        pm.click(bbr)
+    if not wait_until(lambda: pm.checked(bbr) and pm.enabled(adjust), T_VERIFY):
+        raise StepError(step, f"BBR selected={pm.checked(bbr)}, Adjust enabled={pm.enabled(adjust)}.")
+    wait_state(pm, step, popups=(), main_enabled=True, player_id=player_id, quiet=0.5,
+               what="PM idle with BBR selected")
+    log(f"  [{step}] checkpoint: BBR selected")
+
+    step = begin_step(progress, "8_open_adjustment")
+    check_state(pm, step, popups=(), main_enabled=True, player_id=player_id)
+    if not pm.checked(bbr):
+        raise StepError(step, "BBR is no longer selected.")
+    log(f"  [{step}] click Adjust (id={ADJUST_BUTTON})")
+    pm.click(adjust)
+    dialog = wait_state(pm, step, popups=(ADJUST,), main_enabled=False, player_id=player_id,
+                        timeout=T_ADJUST_OPEN, what="Player Adjustment").get(ADJUST)
+    header = control(pm, step, dialog, ADJ_HEADER, "adjustment header", need_enabled=False)
+    if pm.text(header).strip() != "BBR Adjustment":
+        raise StepError(step, f"Player Adjustment is '{pm.text(header)}', expected 'BBR Adjustment'.")
+    log(f"  [{step}] checkpoint: 'BBR Adjustment' is open")
+
+    step = begin_step(progress, "9_add_bbr")
+    check_state(pm, step, popups=(ADJUST,), main_enabled=False, player_id=player_id)
+    add = control(pm, step, dialog, ADJ_ADD_RADIO, "Add BBR")
+    others = [control(pm, step, dialog, cid, name, need_enabled=False)
+              for cid, name in ((ADJ_SUBTRACT_RADIO, "Subtract BBR"), (ADJ_ZERO_RADIO, "Set BBR to 0"))]
+    if not pm.checked(add):
+        click(pm, step, dialog, ADJ_ADD_RADIO, "Add BBR")
+    if not wait_until(lambda: pm.checked(add) and not any(pm.checked(h) for h in others), T_VERIFY):
+        raise StepError(step, "Add BBR is not the only selected option.")
+    log(f"  [{step}] checkpoint: Add BBR selected")
+
+    step = begin_step(progress, "10_enter_adjustment")
+    check_state(pm, step, popups=(ADJUST,), main_enabled=False, player_id=player_id)
+    amount_field = control(pm, step, dialog, ADJ_AMOUNT_EDIT, "Adjustment")
+    current = money(pm.text(control(pm, step, dialog, ADJ_CURRENT, "Current Balance", need_enabled=False)))
+    new_label = control(pm, step, dialog, ADJ_NEW, "New Balance", need_enabled=False)
+    if current is None:
+        raise StepError(step, "Current Balance is not readable.")
+    set_and_verify(pm, step, amount_field, amount, "Adjustment", numeric=True)
+    expected_new = round(current + float(amount), 2)
+    if not wait_until(lambda: money(pm.text(new_label)) is not None
+                      and abs(money(pm.text(new_label)) - expected_new) < 0.005, T_VERIFY):
+        raise StepError(step, f"New Balance shows '{pm.text(new_label)}', expected {expected_new:.2f} "
+                              f"(current {current:.2f} + {amount}).")
+    log(f"  [{step}] checkpoint: New Balance {current:.2f} + {amount} = {expected_new:.2f}")
+
+    step = begin_step(progress, "11_set_expiration")
+    check_state(pm, step, popups=(ADJUST,), main_enabled=False, player_id=player_id)
+    picker = control(pm, step, dialog, ADJ_EXPIRATION, "Expiration")
+    log(f"  [{step}] set Expiration to {expires:%m/%d/%Y %I:%M %p}")
+    pm.date_set(picker, expires)
+    if not wait_until(lambda: pm.date_get(picker) == expires, T_VERIFY):
+        raise StepError(step, f"Expiration shows {pm.date_get(picker)}, expected {expires}.")
+    wait_state(pm, step, popups=(ADJUST,), main_enabled=False, player_id=player_id, quiet=0.3,
+               what="Player Adjustment only")
+    log(f"  [{step}] checkpoint: Expiration = {expires:%m/%d/%Y %I:%M %p}")
+
+    step = begin_step(progress, "12_select_reason")
+    check_state(pm, step, popups=(ADJUST,), main_enabled=False, player_id=player_id)
+    reason_combo = control(pm, step, dialog, ADJ_REASON_COMBO, "Reason")
+    select_combo(pm, step, reason_combo, wf["reason"], "Reason")
+    wait_state(pm, step, popups=(ADJUST,), main_enabled=False, player_id=player_id,
+               what="Player Adjustment only")
+    log(f"  [{step}] checkpoint: Reason = {wf['reason']}")
+
+    step = begin_step(progress, "13_enter_comment")
+    check_state(pm, step, popups=(ADJUST,), main_enabled=False, player_id=player_id)
+    comment_field = control(pm, step, dialog, ADJ_COMMENT_EDIT, "Comment")
+    set_and_verify(pm, step, comment_field, comment, "Comment")
+    wait_state(pm, step, popups=(ADJUST,), main_enabled=False, player_id=player_id, quiet=0.5,
+               what="no popup after the comment")
+
+    step = begin_step(progress, "14_ok_adjustment" if allow_ok else "14_cancel_adjustment")
+    check_state(pm, step, popups=(ADJUST,), main_enabled=False, player_id=player_id)
+    problems = []
+    if pm.text(header).strip() != "BBR Adjustment":
+        problems.append("header")
+    if not pm.checked(add) or any(pm.checked(h) for h in others):
+        problems.append("Add BBR")
+    if normalized_number_text(pm.text(amount_field)) != normalized_number_text(amount):
+        problems.append("Adjustment")
+    if money(pm.text(new_label)) is None or abs(money(pm.text(new_label)) - expected_new) >= 0.005:
+        problems.append("New Balance")
+    if pm.date_get(picker) != expires:
+        problems.append("Expiration")
+    if pm.combo_selected(reason_combo) != wf["reason"]:
+        problems.append("Reason")
+    if pm.text(comment_field).strip() != comment:
+        problems.append("Comment")
+    if active_profile_tab(pm, step, player_id) != progress["tab"]:
+        problems.append("profile tab")
+    if problems:
+        raise StepError(step, f"changed before the final click: {', '.join(problems)}. Nothing was clicked.")
+    log(f"  [{step}] final check OK: player {player_id}, Add BBR {amount}, expires "
+        f"{expires:%m/%d/%Y %I:%M %p}, {wf['reason']}, '{comment}'")
+    finish_dialog(pm, step, job, progress, dialog, allow_ok)
+
+
+def process_job(pm, job, progress, allow_ok=False):
+    open_profile(pm, job, progress)
+    if WORKFLOWS[job["workflow"]]["kind"] == "coupon":
+        run_coupon(pm, job, progress, allow_ok)
+    else:
+        run_bbr(pm, job, progress, allow_ok)
+
+
+def close_profile_tabs(pm, tabs):
+    step = "13_close_profile_tabs"
+    log(f"Closing {len(tabs)} profile tab(s) opened by this run.")
+    closed = 0
+    for tab, player_id in tabs:
+        if not pm.exists(tab):
+            continue
+        title = pm.window_title(tab)
+        if not title_has_player(title, player_id):
+            log(f"  [{step}] skip tab #{tab}: title '{title}' is not player {player_id}")
+            continue
+        check_state(pm, step, popups=(), main_enabled=True)
+        log(f"  [{step}] close tab '{title}'")
+        pm.close_tab(tab)
+        if not wait_until(lambda: not pm.exists(tab) or not pm.visible(tab), T_TAB_CLOSE):
+            raise StepError(step, f"tab '{title}' did not close. State: {read_state(pm).summary()}")
+        wait_state(pm, step, popups=(), main_enabled=True, timeout=T_TAB_CLOSE, quiet=0.5,
+                   what="PM idle after closing the tab")
+        closed += 1
+    log(f"Profile tabs closed: {closed}")
+
+
+# ------------------------------------------------------------------ run
+
+LEDGER_FIELDS = ["timestamp", "date", "workflow", "player_id", "amount", "target", "expiration", "comment",
+                 "status", "sheet", "excel_row"]
+
+
+def ledger_done_today():
+    """(player, workflow) pairs with an OK click recorded today (OK_CLICKED or DONE)."""
+    if not LEDGER_FILE.exists():
+        return set()
+    today = datetime.now().date().isoformat()
+    with LEDGER_FILE.open(newline="", encoding="utf-8-sig") as file:
+        return {(row["player_id"], row.get("workflow", "")) for row in csv.DictReader(file)
+                if row.get("date") == today}
+
+
+def ledger_append(job, status):
+    new_file = not LEDGER_FILE.exists()
+    with LEDGER_FILE.open("a", newline="", encoding="utf-8-sig") as file:
+        writer = csv.DictWriter(file, fieldnames=LEDGER_FIELDS)
+        if new_file:
+            writer.writeheader()
+        now = datetime.now()
+        writer.writerow({"timestamp": now.isoformat(timespec="seconds"), "date": now.date().isoformat(),
+                         "workflow": job["workflow"], "player_id": job["player_id"], "amount": job["amount"],
+                         "target": job["target"], "expiration": job["expiration"], "comment": job["comment"],
+                         "status": status, "sheet": job["sheet"], "excel_row": job["excel_row"]})
+
+
+def ask_allow_ok(jobs):
+    print("\n" + "=" * 78)
+    for workflow in WORKFLOW_ORDER:
+        part = [j for j in jobs if j["workflow"] == workflow]
+        if not part:
+            continue
+        wf = WORKFLOWS[workflow]
+        total = sum(float(j["amount"]) for j in part)
+        print(f"#{wf['no']} {wf['label']}: {len(part)} job(s), total {normalized_number_text(total)}"
+              f"  [{part[0]['target']}]" + (f" expires {part[0]['expiration']}, comment '{part[0]['comment']}'"
+                                            if part[0]["expiration"] else ""))
+        for job in part:
+            print(f"     {job['sheet']} row {job['excel_row']:>4}  player {job['player_id']:>8}  amount {job['amount']}")
+    print("=" * 78)
+    answer = input("Allow clicking OK (REAL coupon redemption / BBR adjustment)?\n"
+                   "Type YES to click OK, anything else = Cancel only (test run): ")
+    return answer.strip() == "YES"
+
+
+CSV_FIELDS = [
+    "timestamp", "order", "workflow", "sheet", "excel_row", "player_id", "amount", "target", "expiration",
+    "comment", "test_mode", "status", "failed_step", "message", "identification", "name_color", "stop_codes",
+    "system_messages", "comment_pages", "duration_s",
+]
+
+
+def write_log(rows):
+    with LOG_FILE.open("w", newline="", encoding="utf-8-sig") as file:
+        writer = csv.DictWriter(file, fieldnames=CSV_FIELDS)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def run(pm, jobs, username, password, allow_ok=False, today=None):
+    """Process every job in order; stop at the first error and leave PM untouched."""
+    today = today or date.today()
+    log(f"Mode: {'OK - REAL REDEMPTION / ADJUSTMENT' if allow_ok else 'Cancel only (test run)'}; "
+        f"today = {today:%m/%d/%Y}")
+    done_today = ledger_done_today() if allow_ok else set()
+    results = []
+    tabs = []
+    try:
+        ensure_logged_in(pm, username, password)
+    except Exception as exc:
+        log(f"STOPPED at login: {exc}")
+        write_log(results)
+        return 1
+
+    for index, job in enumerate(jobs, start=1):
+        started = time.time()
+        progress = {"step": "1_precheck_idle", "today": today}
+        wf = WORKFLOWS[job["workflow"]]
+        record = {
+            "timestamp": datetime.now().isoformat(timespec="seconds"), "order": index,
+            "workflow": job["workflow"], "sheet": job["sheet"], "excel_row": job["excel_row"],
+            "player_id": job["player_id"], "amount": job["amount"], "target": job["target"],
+            "expiration": job["expiration"], "comment": job["comment"], "test_mode": not allow_ok,
+            "status": "", "failed_step": "", "message": "", "identification": "", "name_color": "",
+            "stop_codes": "", "system_messages": "", "comment_pages": "", "duration_s": "",
+        }
+        log(f"[{index}/{len(jobs)}] #{wf['no']} {wf['label']}: player {job['player_id']}, amount {job['amount']} "
+            f"({job['sheet']} row {job['excel_row']})")
+        if (job["player_id"], job["workflow"]) in done_today:
+            record.update({"status": "SKIPPED_ALREADY_DONE", "duration_s": 0,
+                           "message": f"OK was already clicked today for this workflow (see {LEDGER_FILE.name})."})
+            results.append(record)
+            write_log(results)
+            log("  skipped: already done today")
+            continue
+        try:
+            process_job(pm, job, progress, allow_ok)
+            record["status"] = "DONE" if allow_ok else "TEST_CANCELLED"
+            record["message"] = ("Confirmed with OK." if allow_ok else "All fields filled and checked; cancelled.")
+        except PlayerSkipped as skip:
+            record["status"] = skip.status
+            record["message"] = str(skip)
+            log(f"  [{progress['step']}] {skip.status}: {skip}")
+        except Exception as exc:
+            failed_step = getattr(exc, "step", progress["step"])
+            try:
+                screen = read_state(pm).summary()
+            except Exception:
+                screen = "unavailable"
+            record.update({
+                "status": "ERROR_AFTER_OK" if progress.get("ok_clicked") else "ERROR",
+                "failed_step": failed_step,
+                "message": f"{type(exc).__name__}: {exc} | screen: {screen}",
+            })
+        for key in ("identification", "name_color", "stop_codes", "system_messages", "comment_pages"):
+            record[key] = progress.get(key, "")
+        record["duration_s"] = round(time.time() - started, 1)
+        results.append(record)
+        write_log(results)
+        if progress.get("tab") and (progress["tab"], job["player_id"]) not in tabs:
+            tabs.append((progress["tab"], job["player_id"]))
+        if record["status"].startswith("ERROR"):
+            log(f"#{wf['no']} player {job['player_id']}: ERROR at {record['failed_step']}: {record['message']}")
+            log("STOPPED. PM is left exactly as it is for inspection; no cleanup was done.")
+            log(f"Log file: {LOG_FILE}")
+            return 1
+        log(f"#{wf['no']} player {job['player_id']}: {record['status']} in {record['duration_s']}s")
+
+    if CLOSE_TABS_AT_END:
+        try:
+            close_profile_tabs(pm, tabs)
+        except Exception as exc:
+            log(f"STOPPED while closing tabs at {getattr(exc, 'step', 'close_tabs')}: {exc}")
+            return 1
+    counts = {}
+    for row in results:
+        counts[row["status"]] = counts.get(row["status"], 0) + 1
+    log(f"Done. {counts}")
+    log(f"Log file: {LOG_FILE}")
+    return 0
+
+
+def main():
+    try:
+        from pm_credentials import PM_USERNAME, PM_PASSWORD
+    except ImportError as exc:
+        raise SystemExit("Missing pm_credentials.py in the same folder.") from exc
+
+    today = date.today()
+    log(f"Runner {RUNNER_VERSION}, control mode: {CONTROL_MODE}")
+    jobs, notes, violations = read_plan(today)
+    check_file = write_check_file(jobs, notes, violations)
+    log(f"Excel check written to {check_file.name}: {len(jobs)} job(s), {len(notes)} note(s), "
+        f"{len(violations)} violation(s)")
+    for note in notes:
+        log(f"  NOTE {note['sheet']} row {note['row']} player {note['player_id']}: {note['note']}")
+    if violations:
+        for v in violations:
+            log(f"  VIOLATION {v['rule']}: {v['sheet']} rows {v['rows']} player {v['player_id']} - {v['detail']}")
+        log("STOPPED before touching PM. Fix the Excel file (see the VIOLATIONS sheet) and run again.")
+        return 2
+    if not jobs:
+        log("Nothing to do.")
+        write_log([])
+        return 0
+    allow_ok = ask_allow_ok(jobs)
+    pm = Win32PM()
+    pm.connect()
+    return run(pm, jobs, PM_USERNAME, PM_PASSWORD, allow_ok, today)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except SystemExit:
+        raise
+    except Exception as exc:
+        print(f"[FATAL] {type(exc).__name__}: {exc}")
+        sys.exit(1)

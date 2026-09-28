@@ -295,17 +295,27 @@ def color_name(rgb):
 def region_colors(image, x0, y0, x1, y1):
     """Background (most common) and text (most common clearly different) colour of a region."""
     width, height, raw = image
-    counts = Counter()
+    counts, rows = Counter(), []
     for y in range(max(0, y0), min(height, y1)):
         row = y * width * 4
+        row_counts = Counter()
         for x in range(max(0, x0), min(width, x1)):
             i = row + x * 4
-            counts[(raw[i + 2] & 0xF8, raw[i + 1] & 0xF8, raw[i] & 0xF8)] += 1
+            row_counts[(raw[i + 2] & 0xF8, raw[i + 1] & 0xF8, raw[i] & 0xF8)] += 1
+        rows.append(row_counts)
+        counts.update(row_counts)
     if not counts:
         return None
     background = counts.most_common(1)[0][0]
-    text = next((c for c, _ in counts.most_common()
-                 if sum(abs(a - b) for a, b in zip(c, background)) > 90), None)
+    # Text colour ignores rows that are one solid line (the name has an underline).
+    text_counts = Counter()
+    for row_counts in rows:
+        top, n = row_counts.most_common(1)[0]
+        if top != background and n >= 0.7 * sum(row_counts.values()):
+            continue
+        text_counts.update({c: k for c, k in row_counts.items()
+                            if sum(abs(a - b) for a, b in zip(c, background)) > 90})
+    text = text_counts.most_common(1)[0][0] if text_counts else None
     hexed = lambda c: "#%02x%02x%02x" % c if c else None
     return {"background_color": hexed(background), "background_color_name": color_name(background),
             "text_color": hexed(text), "text_color_name": color_name(text) if text else None}
@@ -1616,7 +1626,7 @@ def build_timeline():
     with DATA_LOCK:
         events = sorted(EVENTS, key=lambda e: e.get("t", 0))
         popups = {p["popup_id"]: p for p in POPUPS}
-    lines = ["PM RECORDING TIMELINE (v5)", "=" * 100,
+    lines = [f"PM RECORDING TIMELINE (v{RECORDER_VERSION})", "=" * 100,
              "Columns: seconds since start | wall clock | event", ""]
     for e in events:
         kind = e.get("event")
