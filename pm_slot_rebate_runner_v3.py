@@ -20,6 +20,9 @@ keeps rows where SLOT REBATE 5% != 0, then for each row, strictly in order:
    6  handle profile popups until PM is quiet:
         System Messages -> log every line (incl. Player Stop Codes) -> Close
         Player Comment  -> Next until Close is enabled -> Close
+  6b  read the Identification name (control 1034 in frame 3923) and its colours;
+      a name containing "(Loc:" is not processed (SKIPPED_LOC). The background
+      colour (green for these players) is only logged.
    7  Options... -> Options menu opens
    8  Redeem Coupon... -> Coupon Redemption opens
    9  Competitor Coupon -> Competitor list and Amount become enabled
@@ -68,7 +71,7 @@ try:
 except ImportError:  # lets the step logic be imported and tested off Windows
     win32con = win32gui = win32process = None
 
-RUNNER_VERSION = "3.0-background-gated"
+RUNNER_VERSION = "3.1-background-gated"
 BASE_DIR = Path(__file__).resolve().parent
 EXCEL_FILE = BASE_DIR / "Excel-for-auto.xlsx"
 LOG_FILE = BASE_DIR / "pm_automation_log.csv"
@@ -125,6 +128,9 @@ COUPON_COMPETITOR_COMBO = 1483
 COUPON_AMOUNT_EDIT = 1107
 COUPON_CLICKABLE_IDS = {COUPON_COMPETITOR_RADIO, COUPON_COMPETITOR_COMBO, COUPON_AMOUNT_EDIT, ID_CANCEL}
 REDEEM_MENU_ITEM = "Redeem Coupon..."
+IDENT_FRAME_ID = 3923          # group box "Identification" (same in every recording)
+IDENT_NAME_ID = 1034           # player name inside Identification
+SKIP_NAME_RE = re.compile(r"\(\s*Loc\s*:", re.I)
 FIND_RIBBON_BUTTON = "Find Player"
 
 # Popup kinds.
@@ -158,6 +164,48 @@ class StepError(RuntimeError):
     def __init__(self, step, message):
         super().__init__(message)
         self.step = step
+
+
+class PlayerSkipped(Exception):
+    """The player must not be processed; logged and the run continues."""
+
+    def __init__(self, status, message):
+        super().__init__(message)
+        self.status = status
+
+
+def color_name(rgb):
+    r, g, b = rgb
+    if max(rgb) - min(rgb) < 30:
+        return "white" if min(rgb) > 200 else "black" if max(rgb) < 70 else "gray"
+    if g >= r + 30 and g >= b + 30:
+        return "green"
+    if b >= r + 30 and b >= g - 10:
+        return "blue"
+    if r >= g + 30 and r >= b + 30:
+        return "red"
+    if r > 150 and g > 150 and b < 110:
+        return "yellow"
+    return "other"
+
+
+def region_colors(image, x0, y0, x1, y1):
+    """Background (most common) and text (most common clearly different) colour of a region."""
+    width, height, raw = image
+    counts = {}
+    for y in range(max(0, y0), min(height, y1)):
+        row = y * width * 4
+        for x in range(max(0, x0), min(width, x1)):
+            i = row + x * 4
+            key = (raw[i + 2] & 0xF8, raw[i + 1] & 0xF8, raw[i] & 0xF8)
+            counts[key] = counts.get(key, 0) + 1
+    if not counts:
+        return None
+    ranked = sorted(counts, key=counts.get, reverse=True)
+    background = ranked[0]
+    text = next((c for c in ranked if sum(abs(a - b) for a, b in zip(c, background)) > 90), None)
+    return {"text_color": color_name(text) if text else "none", "background_color": color_name(background),
+            "text_rgb": "#%02x%02x%02x" % text if text else "", "background_rgb": "#%02x%02x%02x" % background}
 
 
 def log(message):
@@ -507,6 +555,43 @@ class Win32PM:
 
     def post_command(self, command_id):
         win32gui.PostMessage(self.main, win32con.WM_COMMAND, int(command_id) & 0xFFFF, 0)
+
+    def rect(self, hwnd):
+        return win32gui.GetWindowRect(hwnd)
+
+    def control_colors(self, hwnd):
+        """Colours of a control, read from PM's own rendering (PrintWindow: no focus, works when covered)."""
+        user32, gdi32 = ctypes.windll.user32, ctypes.windll.gdi32
+        vp = ctypes.c_void_p
+        for fn, args, res in ((user32.GetWindowDC, [vp], vp), (user32.ReleaseDC, [vp, vp], ctypes.c_int),
+                              (user32.PrintWindow, [vp, vp, ctypes.c_uint], ctypes.c_int),
+                              (gdi32.CreateCompatibleDC, [vp], vp),
+                              (gdi32.CreateCompatibleBitmap, [vp, ctypes.c_int, ctypes.c_int], vp),
+                              (gdi32.SelectObject, [vp, vp], vp), (gdi32.DeleteObject, [vp], ctypes.c_int),
+                              (gdi32.DeleteDC, [vp], ctypes.c_int),
+                              (gdi32.GetDIBits, [vp, vp, ctypes.c_uint, ctypes.c_uint, vp, vp, ctypes.c_uint],
+                               ctypes.c_int)):
+            fn.argtypes, fn.restype = args, res
+        left, top, right, bottom = win32gui.GetWindowRect(self.main)
+        width, height = right - left, bottom - top
+        window_dc = user32.GetWindowDC(self.main)
+        memory_dc = gdi32.CreateCompatibleDC(window_dc)
+        bitmap = gdi32.CreateCompatibleBitmap(window_dc, width, height)
+        previous = gdi32.SelectObject(memory_dc, bitmap)
+        try:
+            if not user32.PrintWindow(self.main, memory_dc, 2):      # PW_RENDERFULLCONTENT
+                user32.PrintWindow(self.main, memory_dc, 0)
+            header = (ctypes.c_int32 * 10)(40, width, -height, 0x00200001, 0, 0, 0, 0, 0, 0)  # 32bpp, planes 1
+            buf = ctypes.create_string_buffer(width * height * 4)
+            gdi32.GetDIBits(memory_dc, bitmap, 0, height, buf, header, 0)
+            raw = buf.raw
+        finally:
+            gdi32.SelectObject(memory_dc, previous)
+            gdi32.DeleteObject(bitmap)
+            gdi32.DeleteDC(memory_dc)
+            user32.ReleaseDC(self.main, window_dc)
+        l, t, r, b = win32gui.GetWindowRect(hwnd)
+        return region_colors((width, height, raw), l - left, t - top, r - left, b - top)
 
     def combo_items(self, hwnd):
         return list(HwndWrapper(hwnd).item_texts())
@@ -1017,6 +1102,29 @@ def settle_profile(pm, step, player_id, quiet):
         time.sleep(POLL)
 
 
+def read_identification(pm, step, tab):
+    """Text and colour of the player name in the Identification frame (by control ID)."""
+    frame = pm.child(tab, IDENT_FRAME_ID)
+    name = pm.child(tab, IDENT_NAME_ID)
+    if not frame or not name or not pm.visible(name):
+        raise StepError(step, f"Identification name (id {IDENT_NAME_ID}) not found on the profile tab.")
+    if pm.text(frame).strip() != "Identification":
+        raise StepError(step, f"control {IDENT_FRAME_ID} is '{pm.text(frame)}', expected frame 'Identification'.")
+    fl, ft, fr, fb = pm.rect(frame)
+    nl, nt, nr, nb = pm.rect(name)
+    if not (fl <= nl and nr <= fr and ft <= nt and nb <= fb):
+        raise StepError(step, f"control {IDENT_NAME_ID} is not inside the Identification frame.")
+    text = pm.text(name).strip()
+    if not text:
+        raise StepError(step, "Identification name is empty.")
+    try:
+        colors = pm.control_colors(name) or {}
+    except Exception as exc:
+        log(f"  [{step}] colour not readable: {exc}")
+        colors = {}
+    return text, colors
+
+
 def active_profile_tab(pm, step, player_id):
     tab = pm.mdi_active()
     title = pm.window_title(tab) if tab else ""
@@ -1091,6 +1199,21 @@ def process_player(pm, job, progress, allow_ok=False):
     progress["system_messages"] = " | ".join(messages)
     progress["stop_codes"] = "YES" if STOP_CODES_ITEM in messages else "NO"
     progress["comment_pages"] = pages
+
+    step = begin_step(progress, "6b_check_identification")
+    check_state(pm, step, popups=(), main_enabled=True, player_id=player_id)
+    name, colors = read_identification(pm, step, active_profile_tab(pm, step, player_id))
+    green = colors.get("background_color") == "green" if colors else None
+    color_text = (f"background {colors.get('background_color')} {colors.get('background_rgb')} "
+                  f"(green background: {'YES' if green else 'no'}), "
+                  f"text {colors.get('text_color')} {colors.get('text_rgb')}") if colors else "colour unknown"
+    progress["identification"] = name
+    progress["name_color"] = color_text
+    log(f"  [{step}] Identification name: '{name}' ({color_text})")
+    if SKIP_NAME_RE.search(name):
+        raise PlayerSkipped("SKIPPED_LOC", f"Identification name '{name}' contains '(Loc:' ({color_text}); "
+                                           "player not processed.")
+    log(f"  [{step}] checkpoint: no '(Loc:' in the name, continue")
 
     step = begin_step(progress, "7_open_options_menu")
     check_state(pm, step, popups=(), main_enabled=True, player_id=player_id)
@@ -1236,7 +1359,8 @@ def ask_allow_ok(jobs):
 
 CSV_FIELDS = [
     "timestamp", "excel_row", "player_id", "slot_rebate_5_percent", "test_mode", "status",
-    "failed_step", "message", "stop_codes", "system_messages", "comment_pages", "duration_s",
+    "failed_step", "message", "identification", "name_color", "stop_codes", "system_messages",
+    "comment_pages", "duration_s",
 ]
 
 
@@ -1271,6 +1395,7 @@ def run(pm, jobs, username, password, allow_ok=False):
             "slot_rebate_5_percent": job["amount"],
             "test_mode": not allow_ok,
             "status": "", "failed_step": "", "message": "",
+            "identification": "", "name_color": "",
             "stop_codes": "", "system_messages": "", "comment_pages": "", "duration_s": "",
         }
         log(f"[{index}/{len(jobs)}] Player ID {job['player_id']}, Amount {job['amount']} "
@@ -1290,6 +1415,10 @@ def run(pm, jobs, username, password, allow_ok=False):
             else:
                 record["status"] = "TEST_CANCELLED"
                 record["message"] = "Amount entered from Excel; Coupon Redemption cancelled."
+        except PlayerSkipped as skip:
+            record["status"] = skip.status
+            record["message"] = str(skip)
+            log(f"  [{progress['step']}] {skip.status}: {skip}")
         except Exception as exc:
             failed_step = getattr(exc, "step", progress["step"])
             try:
@@ -1301,6 +1430,8 @@ def run(pm, jobs, username, password, allow_ok=False):
                 "failed_step": failed_step,
                 "message": f"{type(exc).__name__}: {exc} | screen: {screen}",
             })
+        record["identification"] = progress.get("identification", "")
+        record["name_color"] = progress.get("name_color", "")
         record["stop_codes"] = progress.get("stop_codes", "")
         record["system_messages"] = progress.get("system_messages", "")
         record["comment_pages"] = progress.get("comment_pages", "")
