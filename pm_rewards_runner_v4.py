@@ -78,7 +78,7 @@ try:
 except ImportError:  # lets the step logic be imported and tested off Windows
     win32con = win32gui = win32process = None
 
-RUNNER_VERSION = "4.7-four-workflows"
+RUNNER_VERSION = "4.8-four-workflows"
 BASE_DIR = Path(__file__).resolve().parent
 EXCEL_FILE = BASE_DIR / "Excel-for-auto.xlsx"
 LOG_FILE = BASE_DIR / "pm_automation_log.csv"
@@ -126,6 +126,7 @@ LEDGER_FILE = BASE_DIR / "pm_redeemed_ledger.csv"      # stays here: it is read 
 LOG_DIR_SUFFIX = "-automation-log"
 ERROR_FOLDER = "error"
 VIOLATION_FOLDER = "violation"
+LOC_SHEET = "Loc players to check"   # added to pm_excel_check_<time>.xlsx after the run
 SCREENSHOTS = True               # save pictures of PM when a try fails and when the run stops
 SCREENSHOT_DIR = BASE_DIR / "pm_screenshots"
 SCREENSHOT_MARGIN = 40           # pixels around the control in the close-up picture
@@ -364,6 +365,42 @@ def note_problem(text):
     RUN_FILES.setdefault("problems", []).append(text)
 
 
+def loc_line(row):
+    wf = WORKFLOWS.get(row["workflow"], {})
+    details = [f"amount {row['amount']}", str(row["target"])]
+    if row.get("expiration"):
+        details.append(f"expires {row['expiration']}")
+    if row.get("comment"):
+        details.append(f"comment '{row['comment']}'")
+    return (f"[{row['order']}] #{wf.get('no', '?')} {wf.get('label', row['workflow'])}: player "
+            f"{row['player_id']} ({row['sheet']} row {row['excel_row']}), {', '.join(details)} "
+            f"- name '{row.get('identification', '')}'")
+
+
+def add_loc_sheet(path, rows, stopped_at=None):
+    """Sheet LOC_SHEET in the Excel check file: players skipped for '(Loc:', to be done by hand."""
+    wb = load_workbook(path)
+    if LOC_SHEET in wb.sheetnames:
+        del wb[LOC_SHEET]
+    sheet = wb.create_sheet(LOC_SHEET, 0 if rows else len(wb.sheetnames))
+    sheet.append(["Order", "Workflow", "Sheet", "Excel row", "Player ID", "Amount", "Competitor / Reason",
+                  "Expiration", "Comment", "Identification name", "Name colour", "Checked at", "Done by hand"])
+    for row in rows:
+        wf = WORKFLOWS.get(row["workflow"], {})
+        sheet.append([row["order"], f"#{wf.get('no', '?')} {wf.get('label', row['workflow'])}", row["sheet"],
+                      row["excel_row"], row["player_id"], row["amount"], row["target"], row["expiration"],
+                      row["comment"], row.get("identification", ""), row.get("name_color", ""),
+                      row["timestamp"], ""])
+    if not rows:
+        sheet.append(["No player with '(Loc:' in the Identification name in this run."])
+    if stopped_at:
+        sheet.append([])
+        sheet.append([f"The run stopped at #{stopped_at}: players after it were not checked for '(Loc:'."])
+    if rows:
+        wb.active = 0
+    wb.save(path)
+
+
 def finish_run_files(kind):
     """Print the result; after an error / violation move this run's files into that sub-folder.
 
@@ -374,19 +411,33 @@ def finish_run_files(kind):
     if day_dir is None:
         return None
     problems = RUN_FILES.get("problems") or []
+    loc_rows = RUN_FILES.get("loc")
+    check = RUN_FILES.get("check")
     bar = "=" * 78
     target = day_dir / kind if kind else day_dir
+    if loc_rows is not None and check and Path(check).exists():
+        try:
+            add_loc_sheet(check, loc_rows, RUN_FILES.get("stopped_at"))
+        except Exception as exc:
+            log(f"Could not add the sheet '{LOC_SHEET}' to {Path(check).name}: {exc}")
     log(bar)
     if kind is None:
         log(f"NO ERROR. Logs: {target}")
         for line in problems:
             log(f"  note: {line}")
-        log(bar)
-        return target
-    log(f"{'ERROR' if kind == ERROR_FOLDER else 'VIOLATION in the Excel file'} - please check: {target}")
-    for line in problems or ["see the log file in that folder"]:
-        log(f"  {line}")
+    else:
+        log(f"{'ERROR' if kind == ERROR_FOLDER else 'VIOLATION in the Excel file'} - please check: {target}")
+        for line in problems or ["see the log file in that folder"]:
+            log(f"  {line}")
+    if loc_rows:
+        log("-" * 78)
+        log(f"LOC PLAYERS - NOT PROCESSED, please do them by hand ({len(loc_rows)}): "
+            f"sheet '{LOC_SHEET}' in {target / Path(check).name if check else 'the Excel check file'}")
+        for row in loc_rows:
+            log(f"  {loc_line(row)}")
     log(bar)
+    if kind is None:
+        return target
     target.mkdir(parents=True, exist_ok=True)
     moved = {}
     for path in (TEXT_LOG_FILE, LOG_FILE, RUN_FILES.get("check"), _screens.get("dir")):
@@ -2331,6 +2382,8 @@ def run(pm, jobs, username, password, allow_ok=False, today=None):
         f"today = {today:%m/%d/%Y}")
     done_today = ledger_done_today() if allow_ok else set()
     results = []
+    RUN_FILES["loc"] = []            # SKIPPED_LOC rows, to be done by hand
+    RUN_FILES.pop("stopped_at", None)
     tabs = []
     try:
         ensure_logged_in(pm, username, password)
@@ -2370,6 +2423,8 @@ def run(pm, jobs, username, password, allow_ok=False, today=None):
             record["status"] = skip.status
             record["message"] = str(skip)
             log(f"  [{progress['step']}] {skip.status}: {skip}")
+            if skip.status == "SKIPPED_LOC":
+                RUN_FILES["loc"].append(record)
         except Exception as exc:
             failed_step = getattr(exc, "step", progress["step"])
             try:
@@ -2393,6 +2448,7 @@ def run(pm, jobs, username, password, allow_ok=False, today=None):
             tabs.append((progress["tab"], job["player_id"]))
         if record["status"].startswith("ERROR"):
             log(f"#{wf['no']} player {job['player_id']}: ERROR at {record['failed_step']}: {record['message']}")
+            RUN_FILES["stopped_at"] = index
             note_problem(f"#{index} {job['workflow']} player {job['player_id']} ({job['sheet']} row "
                          f"{job['excel_row']}) {record['status']} at {record['failed_step']}: "
                          f"{record['message'].split(' | screen:')[0][:300]}")
