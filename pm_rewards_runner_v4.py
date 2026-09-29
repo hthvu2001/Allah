@@ -26,7 +26,11 @@ Identification name (skip "(Loc:"), then the workflow steps, each with a check
 before and after. When the check after an action finds it not done (e.g. System
 Messages still open after Close), the action is repeated: at most MAX_ATTEMPTS
 (3) tries in total, only while PM still shows the same screen; then the run
-stops. The final OK is clicked exactly once and never repeated.
+stops. The final OK is clicked exactly once and never repeated. An error that
+Windows reports while sending an action is checked on the control itself (the
+value PM will use): taken -> continue, not taken -> a new try. Each failed try
+and every stop saves pictures of the PM window (the control framed in red, plus
+a close-up of that area) in pm_screenshots/<run time>/, named in the log/CSV.
 At start the runner asks whether it may click OK (YES = real
 redemption / adjustment, anything else = Cancel test run). OK clicks are
 written to pm_redeemed_ledger.csv per player and workflow, and a rerun on the
@@ -41,6 +45,7 @@ import csv
 import ctypes
 import re
 import struct
+import zlib
 import sys
 import threading
 import time
@@ -62,7 +67,7 @@ try:
 except ImportError:  # lets the step logic be imported and tested off Windows
     win32con = win32gui = win32process = None
 
-RUNNER_VERSION = "4.4-four-workflows"
+RUNNER_VERSION = "4.5-four-workflows"
 BASE_DIR = Path(__file__).resolve().parent
 EXCEL_FILE = BASE_DIR / "Excel-for-auto.xlsx"
 LOG_FILE = BASE_DIR / "pm_automation_log.csv"
@@ -103,6 +108,9 @@ FIND_PLAYER_COMMAND_ID = None     # None: found automatically from PM's Ctrl+F a
 FIND_ACCELERATOR = (ord("F"), "CTRL")
 REDEEM_COUPON_COMMAND_ID = None
 LEDGER_FILE = BASE_DIR / "pm_redeemed_ledger.csv"
+SCREENSHOTS = True               # save pictures of PM when a try fails and when the run stops
+SCREENSHOT_DIR = BASE_DIR / "pm_screenshots"
+SCREENSHOT_MARGIN = 40           # pixels around the control in the close-up picture
 CLOSE_TABS_AT_END = True
 FIND_SHORTCUT = "^f"
 
@@ -194,9 +202,10 @@ def background_mode():
 
 
 class StepError(RuntimeError):
-    def __init__(self, step, message):
+    def __init__(self, step, message, hwnd=None):
         super().__init__(message)
         self.step = step
+        self.hwnd = hwnd          # control the step was working on (framed in the screenshot)
 
 
 class PlayerSkipped(Exception):
@@ -220,6 +229,52 @@ def color_name(rgb):
     if r > 150 and g > 150 and b < 110:
         return "yellow"
     return "other"
+
+
+def bgra_to_rgb(width, height, raw):
+    rgb = bytearray(width * height * 3)
+    rgb[0::3], rgb[1::3], rgb[2::3] = raw[2::4], raw[1::4], raw[0::4]
+    return rgb
+
+
+def draw_box(rgb, width, height, box, color=(255, 0, 0), thickness=3):
+    """Red frame just outside `box` (left, top, right, bottom in image pixels)."""
+    left, top = max(0, box[0] - thickness), max(0, box[1] - thickness)
+    right, bottom = min(width, box[2] + thickness), min(height, box[3] + thickness)
+    if left >= right or top >= bottom:
+        return
+    pixel = bytes(color)
+    for y in range(top, bottom):
+        if y < top + thickness or y >= bottom - thickness:
+            xs = range(left, right)
+        else:
+            xs = list(range(left, min(left + thickness, right))) + list(range(max(right - thickness, left), right))
+        for x in xs:
+            i = (y * width + x) * 3
+            rgb[i:i + 3] = pixel
+
+
+def crop_rgb(rgb, width, height, box):
+    left, top = max(0, box[0]), max(0, box[1])
+    right, bottom = min(width, box[2]), min(height, box[3])
+    if left >= right or top >= bottom:
+        return None
+    out = bytearray()
+    for y in range(top, bottom):
+        start = (y * width + left) * 3
+        out += rgb[start:start + (right - left) * 3]
+    return right - left, bottom - top, out
+
+
+def write_png(path, width, height, rgb):
+    stride = width * 3
+    rows = b"".join(b"\x00" + bytes(rgb[y * stride:(y + 1) * stride]) for y in range(height))
+
+    def chunk(tag, data):
+        return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+
+    Path(path).write_bytes(b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
+                           + chunk(b"IDAT", zlib.compress(rows, 6)) + chunk(b"IEND", b""))
 
 
 def region_colors(image, x0, y0, x1, y1):
@@ -835,8 +890,11 @@ class Win32PM:
                                         if i.window_text().strip()], "System Messages text")
         return items or []
 
-    def control_colors(self, hwnd):
-        """Colours of a control, read from PM's own rendering (PrintWindow: no focus, works when covered)."""
+    def _capture(self, window):
+        """PM's own rendering of a top-level window (PrintWindow: no focus, works when covered).
+
+        Returns (width, height, BGRA rows top-down, screen left, screen top).
+        """
         user32, gdi32 = ctypes.windll.user32, ctypes.windll.gdi32
         vp = ctypes.c_void_p
         for fn, args, res in ((user32.GetWindowDC, [vp], vp), (user32.ReleaseDC, [vp, vp], ctypes.c_int),
@@ -848,15 +906,15 @@ class Win32PM:
                               (gdi32.GetDIBits, [vp, vp, ctypes.c_uint, ctypes.c_uint, vp, vp, ctypes.c_uint],
                                ctypes.c_int)):
             fn.argtypes, fn.restype = args, res
-        left, top, right, bottom = win32gui.GetWindowRect(self.main)
+        left, top, right, bottom = win32gui.GetWindowRect(window)
         width, height = right - left, bottom - top
-        window_dc = user32.GetWindowDC(self.main)
+        window_dc = user32.GetWindowDC(window)
         memory_dc = gdi32.CreateCompatibleDC(window_dc)
         bitmap = gdi32.CreateCompatibleBitmap(window_dc, width, height)
         previous = gdi32.SelectObject(memory_dc, bitmap)
         try:
-            if not user32.PrintWindow(self.main, memory_dc, 2):      # PW_RENDERFULLCONTENT
-                user32.PrintWindow(self.main, memory_dc, 0)
+            if not user32.PrintWindow(window, memory_dc, 2):      # PW_RENDERFULLCONTENT
+                user32.PrintWindow(window, memory_dc, 0)
             header = (ctypes.c_int32 * 10)(40, width, -height, 0x00200001, 0, 0, 0, 0, 0, 0)  # 32bpp, planes 1
             buf = ctypes.create_string_buffer(width * height * 4)
             gdi32.GetDIBits(memory_dc, bitmap, 0, height, buf, header, 0)
@@ -865,9 +923,29 @@ class Win32PM:
             gdi32.SelectObject(memory_dc, previous)
             gdi32.DeleteObject(bitmap)
             gdi32.DeleteDC(memory_dc)
-            user32.ReleaseDC(self.main, window_dc)
+            user32.ReleaseDC(window, window_dc)
+        return width, height, raw, left, top
+
+    def control_colors(self, hwnd):
+        """Colours of a control, read from PM's own rendering."""
+        width, height, raw, left, top = self._capture(self.main)
         l, t, r, b = win32gui.GetWindowRect(hwnd)
         return region_colors((width, height, raw), l - left, t - top, r - left, b - top)
+
+    def root(self, hwnd):
+        """Top-level window (dialog or PM main window) that holds a control."""
+        get_ancestor = ctypes.windll.user32.GetAncestor
+        get_ancestor.argtypes, get_ancestor.restype = [ctypes.c_void_p, ctypes.c_uint], ctypes.c_void_p
+        return get_ancestor(hwnd, 2) or hwnd       # GA_ROOT
+
+    def snapshot(self, window, mark=None):
+        """Picture of one PM window: (width, height, BGRA, box of `mark` inside it or None)."""
+        width, height, raw, left, top = self._capture(window)
+        box = None
+        if mark and mark != window and win32gui.IsWindow(mark):
+            l, t, r, b = win32gui.GetWindowRect(mark)
+            box = (l - left, t - top, r - left, b - top)
+        return width, height, raw, box
 
     def combo_items(self, hwnd):
         return list(HwndWrapper(hwnd).item_texts())
@@ -1169,40 +1247,122 @@ def screen_is(popups=(), main_enabled=None):
     return check
 
 
-def attempt_until(pm, step, what, action, done, timeout, same_screen=None, describe=None):
+_screens = {"dir": None, "count": 0}
+
+
+def save_screens(pm, step, reason, target=None, everything=False):
+    """Save pictures of PM windows under SCREENSHOT_DIR/<run time>/ and return the file names.
+
+    target: the control the step was working on; its window is saved whole with the control
+    framed in red, plus a close-up of the area around it. everything: also every open PM popup
+    and the main window. Pictures come from PM's own rendering (PrintWindow): no focus, no
+    mouse, never the rest of the desktop, never the login window. Never stops the run.
+    """
+    if not SCREENSHOTS or not hasattr(pm, "snapshot"):
+        return []
+    saved = []
+    try:
+        if _screens["dir"] is None:
+            _screens["dir"] = SCREENSHOT_DIR / datetime.now().strftime("%Y%m%d_%H%M%S")
+        folder = _screens["dir"]
+        folder.mkdir(parents=True, exist_ok=True)
+        state = read_state(pm)
+        login = {p.hwnd for p in state.popups if p.kind == LOGIN}
+        windows = []
+        if target and pm.exists(target):
+            windows.append((pm.root(target), target))
+        if everything or not windows:
+            windows += [(p.hwnd, None) for p in state.popups if p.kind != LOGIN]
+            windows.append((pm.main, None))
+        seen = set()
+        for window, mark in windows:
+            if not window or window in seen or window in login or (window != pm.main and not pm.visible(window)):
+                continue
+            seen.add(window)
+            width, height, raw, box = pm.snapshot(window, mark)
+            if width <= 0 or height <= 0:
+                continue
+            rgb = bgra_to_rgb(width, height, raw)
+            _screens["count"] += 1
+            name = re.sub(r"[^A-Za-z0-9_.-]+", "_", f"{_screens['count']:03d}_{step}_{reason}")[:90]
+            kind = next((p.kind for p in state.popups if p.hwnd == window), "PM")
+            base = folder / f"{name}_{kind}"
+            if box:
+                area = crop_rgb(rgb, width, height, (box[0] - SCREENSHOT_MARGIN, box[1] - SCREENSHOT_MARGIN,
+                                                     box[2] + SCREENSHOT_MARGIN, box[3] + SCREENSHOT_MARGIN))
+                draw_box(rgb, width, height, box)
+                if area:
+                    area_w, area_h, area_rgb = area
+                    draw_box(area_rgb, area_w, area_h, (box[0] - max(0, box[0] - SCREENSHOT_MARGIN),
+                                                        box[1] - max(0, box[1] - SCREENSHOT_MARGIN),
+                                                        box[2] - max(0, box[0] - SCREENSHOT_MARGIN),
+                                                        box[3] - max(0, box[1] - SCREENSHOT_MARGIN)))
+                    write_png(f"{base}_area.png", area_w, area_h, area_rgb)
+                    saved.append(f"{base.name}_area.png")
+            write_png(f"{base}.png", width, height, rgb)
+            saved.append(f"{base.name}.png")
+        if saved:
+            log(f"  [{step}] screenshot(s) in {folder.name}: {', '.join(saved)}")
+    except Exception as exc:
+        log(f"  [{step}] screenshot not saved: {exc}")
+    return saved
+
+
+def attempt_until(pm, step, what, action, done, timeout, same_screen=None, describe=None, target=None):
     """Do `action`, then wait up to `timeout` for `done()`; repeat it while the result is missing.
 
     At most MAX_ATTEMPTS tries in total. Before a new try PM must still show the screen the
     action was made for (`same_screen(state)`); any other screen or an unknown popup stops the run.
+    An error reported by Windows while sending the action does not stop the run by itself: the
+    result is read back from the control, and only a missing result counts as a failed try.
+    Each failed try saves a screenshot of `target` (the control) and its window.
     """
+    errors = {}
     for attempt in range(1, MAX_ATTEMPTS + 1):
         if attempt > 1:
             time.sleep(RETRY_PAUSE_SECONDS)
             state = read_state(pm)
             raise_on_unknown(pm, step, state, what)
-            result = _safe_done(done)
+            result = _safe_done(done, errors)
             if result:
                 log(f"  [{step}] {what}: done (late, no new try needed)")
                 return result
             if same_screen is not None and not same_screen(state):
                 raise StepError(step, f"{what}: not done and PM shows another screen, so it is not repeated"
-                                      f"{_details(describe)}. State: {state.summary()}")
+                                      f"{_details(describe)}{_errors(errors)}. State: {state.summary()}", target)
+            save_screens(pm, step, f"{what}_try{attempt - 1}_not_done", target)
             log(f"  [{step}] {what}: not done yet, trying again (try {attempt}/{MAX_ATTEMPTS})")
-        action(attempt)
+        try:
+            action(attempt)
+        except StepError:
+            raise
+        except Exception as exc:
+            errors["send"] = f"{type(exc).__name__}: {exc}"
+            log(f"  [{step}] {what}: Windows reported an error ({errors['send']}); "
+                f"checking the control to see whether it took effect")
         deadline = time.time() + timeout
         while True:
             state = read_state(pm)
             raise_on_unknown(pm, step, state, what)
-            result = _safe_done(done)
+            result = _safe_done(done, errors)
             if result:
-                if attempt > 1:
-                    log(f"  [{step}] {what}: done on try {attempt}")
+                if attempt > 1 or "send" in errors:
+                    log(f"  [{step}] {what}: done on try {attempt} (checked on the control)")
                 return result
             if time.time() > deadline:
                 break
             time.sleep(POLL)
     raise StepError(step, f"{what}: still not done after {MAX_ATTEMPTS} tries"
-                          f"{_details(describe)}. State: {read_state(pm).summary()}")
+                          f"{_details(describe)}{_errors(errors)}. State: {read_state(pm).summary()}", target)
+
+
+def _errors(errors):
+    parts = []
+    if "send" in errors:
+        parts.append(f"last Windows error: {errors['send']}")
+    if "read" in errors:
+        parts.append(f"last read error: {errors['read']}")
+    return f" [{'; '.join(parts)}]" if parts else ""
 
 
 def _details(describe):
@@ -1214,13 +1374,15 @@ def _details(describe):
         return f" (details not readable: {exc})"
 
 
-def _safe_done(done):
+def _safe_done(done, errors=None):
     """done() with read errors (e.g. a control being destroyed) counted as 'not yet'."""
     try:
         return done()
     except StepError:
         raise
-    except Exception:
+    except Exception as exc:
+        if errors is not None:
+            errors["read"] = f"{type(exc).__name__}: {exc}"
         return None
 
 
@@ -1229,7 +1391,8 @@ def close_popup(pm, step, popup, control_id, what, expect, timeout=None):
     attempt_until(pm, step, what,
                   lambda attempt: click(pm, step, popup, control_id, what, expect=expect),
                   lambda: not pm.visible(popup.hwnd), timeout or T_POPUP_CLOSE,
-                  same_screen=lambda state: any(p.hwnd == popup.hwnd for p in state.popups))
+                  same_screen=lambda state: any(p.hwnd == popup.hwnd for p in state.popups),
+                  target=pm.child(popup.hwnd, control_id) or popup.hwnd)
     log(f"  [{step}] {popup.kind} closed")
 
 
@@ -1291,7 +1454,7 @@ def set_and_verify(pm, step, hwnd, value, what, numeric=False, screen=None):
 
     attempt_until(pm, step, f"{what} = {expected}", action, lambda: norm(pm.text(hwnd)) == expected, T_VERIFY,
                   same_screen=screen_is(screen) if screen is not None else None,
-                  describe=lambda: f"field shows '{pm.text(hwnd)}'")
+                  describe=lambda: f"field shows '{pm.text(hwnd)}'", target=hwnd)
     log(f"  [{step}] checkpoint: {what} = {expected}")
 
 
@@ -1346,7 +1509,7 @@ def open_find_player(pm, step):
 
     state = attempt_until(pm, step, "open Find a Player", action,
                           lambda: state_if(pm, popups=(FIND,), main_enabled=False), T_FIND_OPEN,
-                          same_screen=screen_is((), main_enabled=True))
+                          same_screen=screen_is((), main_enabled=True), target=pm.main)
     log(f"  [{step}] post-check OK  {state.summary()}")
     return state
 
@@ -1438,7 +1601,8 @@ def handle_player_comment(pm, step, popup):
 
             attempt_until(pm, step, "Player Comment Next", press_next,
                           lambda: comment_signature(pm, popup, next_hwnd, close_hwnd) != before, T_COMMENT_PAGE,
-                          same_screen=lambda state: any(p.hwnd == popup.hwnd for p in state.popups))
+                          same_screen=lambda state: any(p.hwnd == popup.hwnd for p in state.popups),
+                          target=next_hwnd)
             page += 1
             continue
         # Next can be hidden for ~0.1s while PM redraws it.
@@ -1534,7 +1698,7 @@ def select_combo(pm, step, combo_hwnd, value, what, screen):
 
     attempt_until(pm, step, f"{what} = {value}", action, lambda: pm.combo_selected(combo_hwnd) == value,
                   T_VERIFY, same_screen=lambda state: state.kinds() in (sorted(screen), sorted(tuple(screen) + (DROPDOWN,))),
-                  describe=lambda: f"list shows '{pm.combo_selected(combo_hwnd)}'")
+                  describe=lambda: f"list shows '{pm.combo_selected(combo_hwnd)}'", target=combo_hwnd)
 
 
 def money(text):
@@ -1588,7 +1752,8 @@ def open_profile(pm, job, progress):
     attempt_until(pm, step, "Find a Player OK",
                   lambda attempt: click(pm, step, find, ID_OK, "Find a Player OK", expect="OK"),
                   lambda: not pm.visible(find.hwnd), T_FIND_CLOSE,
-                  same_screen=lambda state: state.get(FIND) is not None and pm.text(field).strip() == player_id)
+                  same_screen=lambda state: state.get(FIND) is not None and pm.text(field).strip() == player_id,
+                  target=pm.child(find.hwnd, ID_OK) or find.hwnd)
     log(f"  [{step}] FIND closed")
 
     step = begin_step(progress, "5_wait_profile_loaded")
@@ -1659,7 +1824,7 @@ def run_coupon(pm, job, progress, allow_ok):
 
         attempt_until(pm, step, "open the Options menu", open_menu,
                       lambda: state_if(pm, popups=(MENU,), main_enabled=True, player_id=player_id), T_MENU_OPEN,
-                      same_screen=screen_is((), main_enabled=True))
+                      same_screen=screen_is((), main_enabled=True), target=options)
         log(f"  [{step}] post-check OK  Options menu is open")
 
     step = begin_step(progress, "8_click_redeem_coupon")
@@ -1689,7 +1854,7 @@ def run_coupon(pm, job, progress, allow_ok):
         redeem_screen = lambda state: state.kinds() in ([], [MENU]) and state.main_enabled
     attempt_until(pm, step, "open Coupon Redemption", redeem,
                   lambda: state_if(pm, popups=(COUPON,), main_enabled=False, player_id=player_id), T_COUPON_OPEN,
-                  same_screen=redeem_screen)
+                  same_screen=redeem_screen, target=options or pm.main)
     log(f"  [{step}] post-check OK  Coupon Redemption is open")
 
     step = begin_step(progress, "9_select_competitor_coupon")
@@ -1706,7 +1871,7 @@ def run_coupon(pm, job, progress, allow_ok):
                   and pm.enabled(combo) and pm.enabled(amount_field), T_FIELDS_ENABLE,
                   same_screen=screen_is((COUPON,), main_enabled=False),
                   describe=lambda: f"selected={pm.checked(radio)}, list enabled={pm.enabled(combo)}, "
-                                   f"Amount enabled={pm.enabled(amount_field)}")
+                                   f"Amount enabled={pm.enabled(amount_field)}", target=radio)
     wait_state(pm, step, popups=(COUPON,), main_enabled=False, player_id=player_id,
                what="Coupon Redemption only")
     log(f"  [{step}] checkpoint: Competitor Coupon selected, list and Amount enabled")
@@ -1761,7 +1926,8 @@ def run_bbr(pm, job, progress, allow_ok):
 
     attempt_until(pm, step, "select BBR", select_bbr, lambda: pm.checked(bbr) and pm.enabled(adjust), T_VERIFY,
                   same_screen=screen_is((), main_enabled=True),
-                  describe=lambda: f"BBR selected={pm.checked(bbr)}, Adjust enabled={pm.enabled(adjust)}")
+                  describe=lambda: f"BBR selected={pm.checked(bbr)}, Adjust enabled={pm.enabled(adjust)}",
+                  target=bbr)
     wait_state(pm, step, popups=(), main_enabled=True, player_id=player_id, quiet=0.5,
                what="PM idle with BBR selected")
     log(f"  [{step}] checkpoint: BBR selected")
@@ -1777,8 +1943,8 @@ def run_bbr(pm, job, progress, allow_ok):
     dialog = attempt_until(pm, step, "open Player Adjustment", press_adjust,
                            lambda: state_if(pm, popups=(ADJUST,), main_enabled=False, player_id=player_id),
                            T_ADJUST_OPEN,
-                           same_screen=lambda state: screen_is((), main_enabled=True)(state) and pm.checked(bbr)
-                           ).get(ADJUST)
+                           same_screen=lambda state: screen_is((), main_enabled=True)(state) and pm.checked(bbr),
+                           target=adjust).get(ADJUST)
     header = control(pm, step, dialog, ADJ_HEADER, "adjustment header", need_enabled=False)
     if pm.text(header).strip() != "BBR Adjustment":
         raise StepError(step, f"Player Adjustment is '{pm.text(header)}', expected 'BBR Adjustment'.")
@@ -1795,7 +1961,7 @@ def run_bbr(pm, job, progress, allow_ok):
 
     attempt_until(pm, step, "select Add BBR", select_add,
                   lambda: pm.checked(add) and not any(pm.checked(h) for h in others), T_VERIFY,
-                  same_screen=screen_is((ADJUST,), main_enabled=False))
+                  same_screen=screen_is((ADJUST,), main_enabled=False), target=add)
     log(f"  [{step}] checkpoint: Add BBR selected")
 
     step = begin_step(progress, "10_enter_adjustment")
@@ -1817,7 +1983,8 @@ def run_bbr(pm, job, progress, allow_ok):
                   and new_balance_ok(), T_VERIFY,
                   same_screen=screen_is((ADJUST,), main_enabled=False),
                   describe=lambda: f"Adjustment shows '{pm.text(amount_field)}', New Balance shows "
-                                   f"'{pm.text(new_label)}', expected {expected_new:.2f} = {current:.2f} + {amount}")
+                                   f"'{pm.text(new_label)}', expected {expected_new:.2f} = {current:.2f} + {amount}",
+                  target=amount_field)
     log(f"  [{step}] checkpoint: Adjustment = {amount}")
     log(f"  [{step}] checkpoint: New Balance {current:.2f} + {amount} = {expected_new:.2f}")
 
@@ -1830,7 +1997,7 @@ def run_bbr(pm, job, progress, allow_ok):
 
     attempt_until(pm, step, "Expiration", set_date, lambda: pm.date_get(picker) == expires, T_VERIFY,
                   same_screen=screen_is((ADJUST,), main_enabled=False),
-                  describe=lambda: f"Expiration shows {_safe_done(lambda: pm.date_get(picker))}")
+                  describe=lambda: f"Expiration shows {_safe_done(lambda: pm.date_get(picker))}", target=picker)
     wait_state(pm, step, popups=(ADJUST,), main_enabled=False, player_id=player_id, quiet=0.3,
                what="Player Adjustment only")
     log(f"  [{step}] checkpoint: Expiration = {expires:%m/%d/%Y %I:%M %p}")
@@ -1890,7 +2057,7 @@ def close_tab_until_gone(pm, step, tab, what):
         pm.close_tab(tab)
 
     attempt_until(pm, step, what, close, lambda: not pm.exists(tab) or not pm.visible(tab), T_TAB_CLOSE,
-                  same_screen=screen_is((), main_enabled=True))
+                  same_screen=screen_is((), main_enabled=True), target=tab)
 
 
 def close_profile_tabs(pm, tabs):
@@ -1963,7 +2130,7 @@ def ask_allow_ok(jobs):
 CSV_FIELDS = [
     "timestamp", "order", "workflow", "sheet", "excel_row", "player_id", "amount", "target", "expiration",
     "comment", "test_mode", "status", "failed_step", "message", "identification", "name_color", "stop_codes",
-    "system_messages", "comment_pages", "duration_s",
+    "system_messages", "comment_pages", "duration_s", "screenshots",
 ]
 
 
@@ -1999,7 +2166,7 @@ def run(pm, jobs, username, password, allow_ok=False, today=None):
             "player_id": job["player_id"], "amount": job["amount"], "target": job["target"],
             "expiration": job["expiration"], "comment": job["comment"], "test_mode": not allow_ok,
             "status": "", "failed_step": "", "message": "", "identification": "", "name_color": "",
-            "stop_codes": "", "system_messages": "", "comment_pages": "", "duration_s": "",
+            "stop_codes": "", "system_messages": "", "comment_pages": "", "duration_s": "", "screenshots": "",
         }
         log(f"[{index}/{len(jobs)}] #{wf['no']} {wf['label']}: player {job['player_id']}, amount {job['amount']} "
             f"({job['sheet']} row {job['excel_row']})")
@@ -2028,6 +2195,8 @@ def run(pm, jobs, username, password, allow_ok=False, today=None):
                 "status": "ERROR_AFTER_OK" if progress.get("ok_clicked") else "ERROR",
                 "failed_step": failed_step,
                 "message": f"{type(exc).__name__}: {exc} | screen: {screen}",
+                "screenshots": " ".join(save_screens(pm, failed_step, "stopped", getattr(exc, "hwnd", None),
+                                                     everything=True)),
             })
         for key in ("identification", "name_color", "stop_codes", "system_messages", "comment_pages"):
             record[key] = progress.get(key, "")
@@ -2048,6 +2217,8 @@ def run(pm, jobs, username, password, allow_ok=False, today=None):
             close_profile_tabs(pm, tabs)
         except Exception as exc:
             log(f"STOPPED while closing tabs at {getattr(exc, 'step', 'close_tabs')}: {exc}")
+            save_screens(pm, getattr(exc, "step", "close_tabs"), "stopped", getattr(exc, "hwnd", None),
+                         everything=True)
             return 1
     counts = {}
     for row in results:
