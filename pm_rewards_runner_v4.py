@@ -57,13 +57,12 @@ try:
     import win32process
     from pywinauto import Desktop, handleprops, mouse
     from pywinauto import uia_defines
-    from pywinauto.remote_memory_block import RemoteMemoryBlock
     from pywinauto.controls.hwndwrapper import HwndWrapper
     from pywinauto.keyboard import send_keys
 except ImportError:  # lets the step logic be imported and tested off Windows
     win32con = win32gui = win32process = None
 
-RUNNER_VERSION = "4.3-four-workflows"
+RUNNER_VERSION = "4.4-four-workflows"
 BASE_DIR = Path(__file__).resolve().parent
 EXCEL_FILE = BASE_DIR / "Excel-for-auto.xlsx"
 LOG_FILE = BASE_DIR / "pm_automation_log.csv"
@@ -75,7 +74,6 @@ DAILY_COLUMNS = ("PLAYER ID", "FREE PLAY", "ALLOCATION")
 TEST_PLAYER_IDS = {"10001"}        # exempt from the conflict / duplicate rules
 EXPIRATION_TIME = (5, 59)          # 05:59 AM
 MONTHS = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"]
-NOTIFY_DATE_CHANGE = True          # tell the dialog the Expiration changed, as a user edit would
 
 
 def rebate_comment(today):
@@ -161,7 +159,6 @@ ADJ_EXPIRATION = 1031          # date/time picker
 ADJ_REASON_COMBO = 1100
 ADJ_COMMENT_EDIT = 1004
 ADJUST_CLICKABLE_IDS = {ADJ_ADD_RADIO, ID_CANCEL}
-DTN_DATETIMECHANGE = -759
 IDENT_FRAME_ID = 3923          # group box "Identification" (same in every recording)
 IDENT_NAME_ID = 1034           # player name inside Identification
 SKIP_NAME_RE = re.compile(r"\(\s*Loc\s*:", re.I)
@@ -791,32 +788,17 @@ class Win32PM:
         return win32gui.GetWindowRect(hwnd)
 
     def date_set(self, hwnd, value):
-        """Set a date/time picker (DTM_SETSYSTEMTIME, no mouse) and notify the dialog."""
+        """Set a date/time picker with DTM_SETSYSTEMTIME (no mouse); the SYSTEMTIME goes through PM's memory.
+
+        No WM_NOTIFY is sent to the dialog: Windows refuses WM_NOTIFY between processes
+        ("Access is denied"). The dialog reads the value from the picker when OK is clicked.
+        """
         HwndWrapper(hwnd).set_time(year=value.year, month=value.month, day_of_week=value.isoweekday() % 7,
                                    day=value.day, hour=value.hour, minute=value.minute)
-        if NOTIFY_DATE_CHANGE:
-            self._notify_date_change(hwnd, value)
 
     def date_get(self, hwnd):
         st = HwndWrapper(hwnd).get_time()
         return datetime(st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute)
-
-    def _notify_date_change(self, hwnd, value):
-        """WM_NOTIFY / DTN_DATETIMECHANGE, laid out for PM's bitness, in PM's own memory."""
-        parent = win32gui.GetParent(hwnd)
-        control_id = win32gui.GetDlgCtrlID(hwnd)
-        st = (value.year, value.month, value.isoweekday() % 7, value.day, value.hour, value.minute, 0, 0)
-        if handleprops.is64bitprocess(self.pid):
-            data = struct.pack("<QQi4xI8H4x", hwnd, control_id, DTN_DATETIMECHANGE, 0, *st)
-        else:
-            data = struct.pack("<IIiI8H", hwnd & 0xFFFFFFFF, control_id, DTN_DATETIMECHANGE, 0, *st)
-        remote = RemoteMemoryBlock(HwndWrapper(hwnd), size=len(data) + 16)
-        try:
-            remote.Write(ctypes.create_string_buffer(data, len(data)))
-            win32gui.SendMessageTimeout(parent, win32con.WM_NOTIFY, control_id, remote.mem_address,
-                                        win32con.SMTO_ABORTIFHUNG, 3000)
-        finally:
-            del remote
 
     def _uia_read(self, read, what, timeout=T_UIA_READ):
         """Run a UIA read in a worker thread; give up after `timeout` instead of blocking the run.
