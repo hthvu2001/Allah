@@ -3,12 +3,14 @@
 
 Reads Excel-for-auto.xlsx and runs, in this order (rows in Excel order):
   #1 REBATE_SLOT  sheet REBATE, SLOT REBATE 5% != 0
-                  Coupon Redemption > Competitor Coupon > DAILY REBATE (5%) - 1 > Amount
+                  Coupon Redemption (F12) > Competitor Coupon > DAILY REBATE (5%) - 1 > Amount
+                  > OK > confirmation "The coupon will reward the player with $X in SLOTS." > OK
   #2 REBATE_BBR   sheet REBATE, BBR REBATE 5% != 0
                   Rewards: BBR > Adjust > Add BBR, Adjustment, Expiration = today + 30 days
                   05:59 AM, Reason "P) Your 5% (Rebate)", Comment "REBATE ON <yesterday>"
   #3 COSMO_SLOT   sheet DAILY REWARDS, ALLOCATION = Slot
-                  Coupon Redemption > Competitor Coupon > COSMO ELITE CIRCUIT - 166 > Amount
+                  Coupon Redemption (F12) > Competitor Coupon > COSMO ELITE CIRCUIT - 166 > Amount
+                  > OK > confirmation > OK
   #4 COSMO_BBR    sheet DAILY REWARDS, ALLOCATION = BBR
                   Rewards: BBR > Adjust > Add BBR, Adjustment, Expiration = today + 3 days
                   05:59 AM, Reason "P) COSMO ELITE CIRCUIT", Comment "COSMO ELITE CIRCUIT"
@@ -32,7 +34,9 @@ value PM will use): taken -> continue, not taken -> a new try. Each failed try
 and every stop saves pictures of the PM window (the control framed in red, plus
 a close-up of that area) in pm_screenshots/<run time>/, named in the log/CSV.
 At start the runner asks whether it may click OK (YES = real
-redemption / adjustment, anything else = Cancel test run). OK clicks are
+redemption / adjustment, anything else = Cancel test run). A coupon OK is
+followed by PM's confirmation; its amount / name are compared with the row and
+only noted when they differ (the coupon is confirmed anyway). OK clicks are
 written to pm_redeemed_ledger.csv per player and workflow, and a rerun on the
 same day skips them. The first error stops the run and leaves PM as it is.
 
@@ -67,7 +71,7 @@ try:
 except ImportError:  # lets the step logic be imported and tested off Windows
     win32con = win32gui = win32process = None
 
-RUNNER_VERSION = "4.5-four-workflows"
+RUNNER_VERSION = "4.6-four-workflows"
 BASE_DIR = Path(__file__).resolve().parent
 EXCEL_FILE = BASE_DIR / "Excel-for-auto.xlsx"
 LOG_FILE = BASE_DIR / "pm_automation_log.csv"
@@ -107,6 +111,7 @@ CONTROL_MODE = "background"   # "background": messages + UIA only; "mouse": phys
 FIND_PLAYER_COMMAND_ID = None     # None: found automatically from PM's Ctrl+F accelerator
 FIND_ACCELERATOR = (ord("F"), "CTRL")
 REDEEM_COUPON_COMMAND_ID = None
+REDEEM_ACCELERATOR = (0x7B, None)   # F12 opens Coupon Redemption on a profile (recording 09/29)
 LEDGER_FILE = BASE_DIR / "pm_redeemed_ledger.csv"
 SCREENSHOTS = True               # save pictures of PM when a try fails and when the run stops
 SCREENSHOT_DIR = BASE_DIR / "pm_screenshots"
@@ -118,10 +123,10 @@ FIND_SHORTCUT = "^f"
 T_LOGIN = 90
 T_FIND_OPEN = 3            # 0.21-0.31s
 T_FIND_CLOSE = 5           # 0.02-0.16s
-T_PROFILE_LOAD = 30        # 4.1-5.2s from OK to the new title
+T_PROFILE_LOAD = 60        # 3.4-6.6s from OK to the new title; once PM hung 37s (database error)
 T_PROFILE_POPUPS = 60      # System Messages + paging through all comments
 T_POPUP_CLOSE = 5          # 0.12-0.15s
-T_AFTER_OK = 20            # not recorded yet: OK has never been clicked in a recording
+T_AFTER_OK = 60            # confirmation 0.13-0.16s after OK (once 10.7s); Player Adjustment closes in 0.05-0.7s
 T_COMMENT_PAGE = 3         # 0.11-0.2s per Next
 T_MENU_OPEN = 3            # 0.15-0.18s
 T_COUPON_OPEN = 5          # 0.21-0.22s
@@ -176,6 +181,14 @@ FIND_RIBBON_BUTTON = "Find Player"
 LOGIN, FIND, SYSMSG, COMMENT, COUPON, ADJUST, MENU, DROPDOWN, UNKNOWN = (
     "LOGIN", "FIND", "SYSTEM_MESSAGES", "PLAYER_COMMENT", "COUPON", "ADJUSTMENT", "MENU", "DROPDOWN",
     "UNKNOWN")
+# After OK, PM asks again in a second "Coupon Redemption" dialog (owned by the first):
+#   1034 "Mr. GEONWOO KIM", 3733 "Redemption Information",
+#   1502 "The coupon will reward the player with $645.00 in SLOTS.", OK (1) / Cancel (2)
+COUPON_CONFIRM = "COUPON_CONFIRM"
+CONFIRM_NAME_ID = 1034
+CONFIRM_TEXT_ID = 1502
+CONFIRM_TEXT_RE = re.compile(r"reward the player with \$\s*([\d,]+(?:\.\d+)?)\s+in\s+(\w+)", re.I)
+CONFIRM_BUCKET = "SLOTS"
 DIALOG_TITLES = {
     "find a player": FIND,
     "system messages": SYSMSG,
@@ -628,10 +641,18 @@ class Win32PM:
                 log(f"Could not read PM's shortcut table: {exc}")
         log("Find a Player: " + (f"command id {self.find_command} (the Ctrl+F command, sent without the keyboard)"
                                    if self.find_command else "Ribbon button through UIA"))
+        self.redeem_command = REDEEM_COUPON_COMMAND_ID
+        if not self.redeem_command:
+            try:
+                self.redeem_command = self._accelerator_command(*REDEEM_ACCELERATOR)
+            except Exception as exc:
+                log(f"Could not read PM's shortcut table: {exc}")
+        log("Redeem Coupon: " + (f"command id {self.redeem_command} (the F12 command, sent without the keyboard)"
+                                   if self.redeem_command else f"Options... > {REDEEM_MENU_ITEM}"))
 
     def _accelerator_command(self, key, modifier):
         """Command ID PM binds to a shortcut such as Ctrl+F, read from its accelerator tables."""
-        flags_wanted = 0x01 | {"CTRL": 0x08, "SHIFT": 0x04, "ALT": 0x10}[modifier]   # FVIRTKEY | modifier
+        flags_wanted = 0x01 | ({"CTRL": 0x08, "SHIFT": 0x04, "ALT": 0x10}[modifier] if modifier else 0)
         process = win32api.OpenProcess(win32con.PROCESS_QUERY_INFORMATION | win32con.PROCESS_VM_READ,
                                        False, self.pid)
         exe = win32process.GetModuleFileNameEx(process, None)
@@ -663,7 +684,8 @@ class Win32PM:
         if len(commands) == 1:
             return next(iter(commands))
         if commands:
-            log(f"{modifier}+{chr(key)} maps to several commands {commands}; not used.")
+            label = f"F{key - 0x6F}" if 0x70 <= key <= 0x87 else chr(key)
+            log(f"{modifier + '+' if modifier else ''}{label} maps to several commands {commands}; not used.")
         return None
 
     def main_title(self):
@@ -688,7 +710,10 @@ class Win32PM:
                 if IGNORED_CLASS_RE.search(cls):
                     return True
                 title = win32gui.GetWindowText(hwnd)
-                found.append(Popup(hwnd, title, cls, classify(title, cls)))
+                kind = classify(title, cls)
+                if kind == COUPON and self.child(hwnd, CONFIRM_TEXT_ID):
+                    kind = COUPON_CONFIRM
+                found.append(Popup(hwnd, title, cls, kind))
             except win32gui.error:
                 pass
             return True
@@ -1431,7 +1456,7 @@ def control(pm, step, popup, control_id, what, need_enabled=True, timeout=T_VERI
 
 
 def click(pm, step, popup, control_id, what, allow_ok=False, expect=None):
-    allowed = {COUPON: COUPON_CLICKABLE_IDS, ADJUST: ADJUST_CLICKABLE_IDS}.get(popup.kind)
+    allowed = {COUPON: COUPON_CLICKABLE_IDS, ADJUST: ADJUST_CLICKABLE_IDS, COUPON_CONFIRM: set()}.get(popup.kind)
     if allowed is not None and control_id not in allowed | ({ID_OK} if allow_ok else set()):
         raise StepError(step, f"Safety stop: refusing to click control id={control_id} in {popup.title}.")
     hwnd = control(pm, step, popup, control_id, what, expect=expect)
@@ -1802,59 +1827,118 @@ def finish_dialog(pm, step, job, progress, dialog, allow_ok):
     ledger_append(job, "DONE")
 
 
+def confirmation_notes(text, name, amount, identification):
+    """Differences between PM's confirmation and the Excel row (logged only: the coupon is confirmed anyway)."""
+    notes = []
+    match = CONFIRM_TEXT_RE.search(text)
+    if not match:
+        notes.append(f"confirmation text not recognised: '{text}'")
+    else:
+        if abs(float(match.group(1).replace(",", "")) - float(amount)) > 0.005:
+            notes.append(f"confirmation says ${match.group(1)}, Excel amount is {amount}")
+        if match.group(2).upper() != CONFIRM_BUCKET:
+            notes.append(f"confirmation says 'in {match.group(2)}', expected 'in {CONFIRM_BUCKET}'")
+
+    def words(value):
+        return set(re.findall(r"[A-Za-z0-9]+", value.upper()))
+
+    if not name:
+        notes.append("confirmation shows no player name")
+    elif identification and not words(name) <= words(identification):
+        notes.append(f"confirmation name '{name}' is not the profile name '{identification}'")
+    return notes
+
+
+def finish_coupon_ok(pm, step, job, progress, coupon):
+    """OK once, then PM's confirmation ("The coupon will reward the player with $X in SLOTS.") OK once.
+
+    The confirmation is compared with the Excel row and the profile name; a difference is only
+    noted (the coupon is confirmed anyway). Neither OK is ever clicked a second time.
+    """
+    player_id = job["player_id"]
+    ledger_append(job, "OK_CLICKED")
+    progress["ok_clicked"] = True
+    click(pm, step, coupon, ID_OK, "Coupon Redemption OK", allow_ok=True, expect="OK")
+    deadline = time.time() + T_AFTER_OK
+    while True:
+        state = read_state(pm)
+        raise_on_unknown(pm, step, state, "waiting for the coupon confirmation")
+        confirm = state.get(COUPON_CONFIRM)
+        if confirm is not None or (not pm.visible(coupon.hwnd) and state.get(COUPON) is None):
+            break
+        if time.time() > deadline:
+            raise StepError(step, f"no confirmation {T_AFTER_OK}s after OK and Coupon Redemption is still open. "
+                                  f"State: {state.summary()}", coupon.hwnd)
+        time.sleep(POLL)
+    if confirm is None:
+        progress["confirmation_check"] = "no confirmation was shown"
+        log(f"  [{step}] NOTE: Coupon Redemption closed without the usual confirmation")
+    else:
+        step = begin_step(progress, "13_confirm_coupon")
+        check_state(pm, step, popups=(COUPON, COUPON_CONFIRM), main_enabled=False, player_id=player_id)
+        text_hwnd = control(pm, step, confirm, CONFIRM_TEXT_ID, "confirmation text", need_enabled=False)
+        wait_until(lambda: pm.text(text_hwnd).strip(), T_VERIFY)
+        text = " ".join(pm.text(text_hwnd).split())
+        name_hwnd = pm.child(confirm.hwnd, CONFIRM_NAME_ID)
+        name = pm.text(name_hwnd).strip() if name_hwnd else ""
+        notes = confirmation_notes(text, name, job["amount"], progress.get("identification", ""))
+        progress["confirmation"] = f"{name}: {text}" if name else text
+        progress["confirmation_check"] = "; ".join(notes) if notes else "OK"
+        if notes:
+            log(f"  [{step}] NOTE (logged only, confirming anyway): {'; '.join(notes)}")
+        else:
+            log(f"  [{step}] checkpoint: confirmation matches: {progress['confirmation']}")
+        ledger_append(job, "CONFIRM_CLICKED")
+        # Clicked exactly once, like the first OK.
+        click(pm, step, confirm, ID_OK, "confirmation OK", allow_ok=True, expect="OK")
+        wait_popup_closed(pm, step, confirm, T_AFTER_OK)
+    wait_state(pm, step, popups=(), main_enabled=True, player_id=player_id,
+               timeout=T_AFTER_OK, quiet=1.0, what="PM idle after the redemption")
+    ledger_append(job, "DONE")
+
+
 def run_coupon(pm, job, progress, allow_ok):
-    """Workflows #1 and #3: Options > Redeem Coupon... > Competitor Coupon > competitor > amount."""
+    """Workflows #1 and #3: F12 (or Options > Redeem Coupon...) > Competitor Coupon > competitor > amount."""
     player_id, amount = job["player_id"], job["amount"]
     competitor = WORKFLOWS[job["workflow"]]["competitor"]
 
-    step = begin_step(progress, "7_open_options_menu")
+    step = begin_step(progress, "7_open_coupon_redemption")
     check_state(pm, step, popups=(), main_enabled=True, player_id=player_id)
     tab = active_profile_tab(pm, step, player_id)
-    options = None
-    if REDEEM_COUPON_COMMAND_ID:
-        log(f"  [{step}] skipped: Redeem Coupon is sent as command id {REDEEM_COUPON_COMMAND_ID}")
-    else:
-        options = pm.child(tab, OPTIONS_BUTTON)
-        if not options or not pm.enabled(options) or caption(pm, options) != "Options...":
-            raise StepError(step, "Options... button not found, disabled or renamed on the active profile tab.")
+    command = getattr(pm, "redeem_command", None) or REDEEM_COUPON_COMMAND_ID
+    options = pm.child(tab, OPTIONS_BUTTON)
+    menu_usable = bool(options) and pm.enabled(options) and caption(pm, options) == "Options..."
+    if not command and not menu_usable:
+        raise StepError(step, "Options... button not found, disabled or renamed on the active profile tab.")
 
-        def open_menu(attempt):
+    def via_menu():
+        menu = read_state(pm).get(MENU)
+        if menu is None:
             log(f"  [{step}] click Options... (id={OPTIONS_BUTTON})")
             pm.click(options)
+            state = wait_state(pm, step, popups=(MENU,), main_enabled=True, player_id=player_id,
+                               timeout=T_MENU_OPEN, what="the Options menu", fail=False)
+            if state is None:
+                log(f"  [{step}] the Options menu did not open")
+                return
+            menu = state.get(MENU)
+        log(f"  [{step}] click menu item '{REDEEM_MENU_ITEM}'")
+        if not pm.click_menu_item(menu.hwnd, REDEEM_MENU_ITEM):
+            raise StepError(step, f"Menu item '{REDEEM_MENU_ITEM}' not found.")
 
-        attempt_until(pm, step, "open the Options menu", open_menu,
-                      lambda: state_if(pm, popups=(MENU,), main_enabled=True, player_id=player_id), T_MENU_OPEN,
-                      same_screen=screen_is((), main_enabled=True), target=options)
-        log(f"  [{step}] post-check OK  Options menu is open")
+    def open_coupon(attempt):
+        if command and (attempt < MAX_ATTEMPTS or not menu_usable):
+            log(f"  [{step}] send the F12 command (id {command}): Redeem Coupon without the keyboard")
+            pm.post_command(command, accelerator=not REDEEM_COUPON_COMMAND_ID)
+            return
+        if command:
+            log(f"  [{step}] the F12 command did not open Coupon Redemption; using Options... > {REDEEM_MENU_ITEM}")
+        via_menu()
 
-    step = begin_step(progress, "8_click_redeem_coupon")
-    if REDEEM_COUPON_COMMAND_ID:
-        check_state(pm, step, popups=(), main_enabled=True, player_id=player_id)
-        active_profile_tab(pm, step, player_id)
-
-        def redeem(attempt):
-            log(f"  [{step}] post command id {REDEEM_COUPON_COMMAND_ID} (Redeem Coupon...)")
-            pm.post_command(REDEEM_COUPON_COMMAND_ID)
-
-        redeem_screen = screen_is((), main_enabled=True)
-    else:
-        check_state(pm, step, popups=(MENU,), main_enabled=True, player_id=player_id)
-
-        def redeem(attempt):
-            menu = read_state(pm).get(MENU)
-            if menu is None:
-                log(f"  [{step}] the Options menu closed without opening Coupon Redemption; opening it again")
-                pm.click(options)
-                menu = wait_state(pm, step, popups=(MENU,), main_enabled=True, timeout=T_MENU_OPEN,
-                                  what="the Options menu").get(MENU)
-            log(f"  [{step}] click menu item '{REDEEM_MENU_ITEM}'")
-            if not pm.click_menu_item(menu.hwnd, REDEEM_MENU_ITEM):
-                raise StepError(step, f"Menu item '{REDEEM_MENU_ITEM}' not found.")
-
-        redeem_screen = lambda state: state.kinds() in ([], [MENU]) and state.main_enabled
-    attempt_until(pm, step, "open Coupon Redemption", redeem,
+    attempt_until(pm, step, "open Coupon Redemption", open_coupon,
                   lambda: state_if(pm, popups=(COUPON,), main_enabled=False, player_id=player_id), T_COUPON_OPEN,
-                  same_screen=redeem_screen, target=options or pm.main)
+                  same_screen=lambda state: state.kinds() in ([], [MENU]) and state.main_enabled,
+                  target=options if options and not command else pm.main)
     log(f"  [{step}] post-check OK  Coupon Redemption is open")
 
     step = begin_step(progress, "9_select_competitor_coupon")
@@ -1897,7 +1981,10 @@ def run_coupon(pm, job, progress, allow_ok):
             active_profile_tab(pm, step, player_id) != progress["tab"]:
         raise StepError(step, "Coupon fields or profile changed before the final click. Nothing was clicked.")
     log(f"  [{step}] final check OK: player {player_id}, {competitor}, amount {amount}")
-    finish_dialog(pm, step, job, progress, coupon, allow_ok)
+    if allow_ok:
+        finish_coupon_ok(pm, step, job, progress, coupon)
+    else:
+        finish_dialog(pm, step, job, progress, coupon, allow_ok)
 
 
 def run_bbr(pm, job, progress, allow_ok):
@@ -2130,7 +2217,7 @@ def ask_allow_ok(jobs):
 CSV_FIELDS = [
     "timestamp", "order", "workflow", "sheet", "excel_row", "player_id", "amount", "target", "expiration",
     "comment", "test_mode", "status", "failed_step", "message", "identification", "name_color", "stop_codes",
-    "system_messages", "comment_pages", "duration_s", "screenshots",
+    "system_messages", "comment_pages", "confirmation", "confirmation_check", "duration_s", "screenshots",
 ]
 
 
@@ -2166,7 +2253,8 @@ def run(pm, jobs, username, password, allow_ok=False, today=None):
             "player_id": job["player_id"], "amount": job["amount"], "target": job["target"],
             "expiration": job["expiration"], "comment": job["comment"], "test_mode": not allow_ok,
             "status": "", "failed_step": "", "message": "", "identification": "", "name_color": "",
-            "stop_codes": "", "system_messages": "", "comment_pages": "", "duration_s": "", "screenshots": "",
+            "stop_codes": "", "system_messages": "", "comment_pages": "", "confirmation": "",
+            "confirmation_check": "", "duration_s": "", "screenshots": "",
         }
         log(f"[{index}/{len(jobs)}] #{wf['no']} {wf['label']}: player {job['player_id']}, amount {job['amount']} "
             f"({job['sheet']} row {job['excel_row']})")
@@ -2198,7 +2286,8 @@ def run(pm, jobs, username, password, allow_ok=False, today=None):
                 "screenshots": " ".join(save_screens(pm, failed_step, "stopped", getattr(exc, "hwnd", None),
                                                      everything=True)),
             })
-        for key in ("identification", "name_color", "stop_codes", "system_messages", "comment_pages"):
+        for key in ("identification", "name_color", "stop_codes", "system_messages", "comment_pages",
+                    "confirmation", "confirmation_check"):
             record[key] = progress.get(key, "")
         record["duration_s"] = round(time.time() - started, 1)
         results.append(record)
@@ -2224,6 +2313,10 @@ def run(pm, jobs, username, password, allow_ok=False, today=None):
     for row in results:
         counts[row["status"]] = counts.get(row["status"], 0) + 1
     log(f"Done. {counts}")
+    noted = [row for row in results if row.get("confirmation_check") not in ("", "OK")]
+    if noted:
+        log(f"Coupon confirmation notes on {len(noted)} row(s) (column confirmation_check): "
+            + ", ".join(f"#{row['order']} player {row['player_id']}" for row in noted))
     log(f"Log file: {LOG_FILE}")
     return 0
 
