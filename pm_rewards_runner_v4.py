@@ -14,6 +14,17 @@ Reads Excel-for-auto.xlsx and runs, in this order (rows in Excel order):
   #4 COSMO_BBR    sheet DAILY REWARDS, ALLOCATION = BBR
                   Rewards: BBR > Adjust > Add BBR, Adjustment, Expiration = today + 3 days
                   05:59 AM, Reason "P) COSMO ELITE CIRCUIT", Comment "COSMO ELITE CIRCUIT"
+  #5 MONTHLY_SLOT sheet MONTHLY BNF, FP ALLOCATION = SLOT (optional sheet)
+                  Coupon Redemption (F12) > Competitor Coupon > MBS FP - 7 > Amount > OK > confirmation > OK
+  #6 MONTHLY_BBR  sheet MONTHLY BNF, FP ALLOCATION = BBR BUCKET
+                  Rewards: BBR > Adjust > Add BBR, Adjustment, Expiration = today + 14 days
+                  05:59 AM, Reason "G) MBS FP", Comment "MONTHLY BENEFIT - 30SEP2026" (run on the 1st:
+                  last day of the previous month; on the 15th: 15<MON><YYYY>; other days: the user is
+                  asked). The comment is shown at the start: Enter keeps it, or type another one.
+
+After the run the Excel check file gets a STATUS sheet (the three sheets side by
+side, every row with Status + Note) and a "Loc players to check" sheet. Each
+profile tab is closed as soon as its player is finished (Loc players too).
 
 Before touching PM the Excel is checked and a report pm_excel_check_<time>.xlsx
 is written (PLAN, NOTES, VIOLATIONS). The run stops if there is any violation:
@@ -78,7 +89,7 @@ try:
 except ImportError:  # lets the step logic be imported and tested off Windows
     win32con = win32gui = win32process = None
 
-RUNNER_VERSION = "4.8-four-workflows"
+RUNNER_VERSION = "4.9-six-workflows"
 BASE_DIR = Path(__file__).resolve().parent
 EXCEL_FILE = BASE_DIR / "Excel-for-auto.xlsx"
 LOG_FILE = BASE_DIR / "pm_automation_log.csv"
@@ -87,6 +98,10 @@ REBATE_SHEET = "REBATE"
 REBATE_COLUMNS = ("Player ID", "SLOT REBATE 5%", "BBR REBATE 5%")
 DAILY_SHEET = "DAILY REWARDS"
 DAILY_COLUMNS = ("PLAYER ID", "FREE PLAY", "ALLOCATION")
+MONTHLY_SHEET = "MONTHLY BNF"      # optional sheet
+MONTHLY_COLUMNS = ("Player ID", "MONTHLY FP check", "FP ALLOCATION")
+MONTHLY_ALLOCATIONS = {"slot": "MONTHLY_SLOT", "bbr bucket": "MONTHLY_BBR", "bbr": "MONTHLY_BBR"}
+SOURCE_SHEETS = (REBATE_SHEET, DAILY_SHEET, MONTHLY_SHEET)    # the three tables of the STATUS sheet
 TEST_PLAYER_IDS = {"10001"}        # exempt from the conflict / duplicate rules
 EXPIRATION_TIME = (5, 59)          # 05:59 AM
 MONTHS = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"]
@@ -95,6 +110,23 @@ MONTHS = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", 
 def rebate_comment(today):
     yesterday = today - timedelta(days=1)
     return f"REBATE ON {MONTHS[yesterday.month - 1]} {yesterday.day:02d} {yesterday.year}"
+
+
+def monthly_comment(today):
+    """(comment, standard): the 15th -> 15<MON><YYYY>; the 1st -> last day of the previous month.
+
+    Any other day is not a standard run day: the most recent of those two dates is suggested
+    and the user is asked (see ask_monthly_comment).
+    """
+    if today.day == 15:
+        stamp, standard = today, True
+    elif today.day == 1:
+        stamp, standard = today - timedelta(days=1), True
+    elif today.day > 15:
+        stamp, standard = today.replace(day=15), False
+    else:
+        stamp, standard = today.replace(day=1) - timedelta(days=1), False
+    return f"MONTHLY BENEFIT - {stamp.day:02d}{MONTHS[stamp.month - 1]}{stamp.year}", standard
 
 
 WORKFLOWS = {
@@ -106,8 +138,11 @@ WORKFLOWS = {
                    "competitor": "COSMO ELITE CIRCUIT - 166"},
     "COSMO_BBR": {"no": 4, "label": "COSMO ELITE CIRCUIT BBR", "kind": "bbr", "expire_days": 3,
                   "reason": "P) COSMO ELITE CIRCUIT", "comment": lambda today: "COSMO ELITE CIRCUIT"},
+    "MONTHLY_SLOT": {"no": 5, "label": "Monthly Benefit Slot", "kind": "coupon", "competitor": "MBS FP - 7"},
+    "MONTHLY_BBR": {"no": 6, "label": "Monthly Benefit BBR", "kind": "bbr", "expire_days": 14,
+                    "reason": "G) MBS FP", "comment": lambda today: monthly_comment(today)[0]},
 }
-WORKFLOW_ORDER = ["REBATE_SLOT", "REBATE_BBR", "COSMO_SLOT", "COSMO_BBR"]
+WORKFLOW_ORDER = ["REBATE_SLOT", "REBATE_BBR", "COSMO_SLOT", "COSMO_BBR", "MONTHLY_SLOT", "MONTHLY_BBR"]
 STEP_DELAY_SECONDS = 1.0   # pause before every step (checks before/after a step are not shortened)
 ACTION_PAUSE_SECONDS = 0.1   # after sending a click
 MAX_ATTEMPTS = 3             # tries of one action in total when its result is missing (never the final OK)
@@ -131,6 +166,7 @@ SCREENSHOTS = True               # save pictures of PM when a try fails and when
 SCREENSHOT_DIR = BASE_DIR / "pm_screenshots"
 SCREENSHOT_MARGIN = 40           # pixels around the control in the close-up picture
 CLOSE_TABS_AT_END = True
+CLOSE_TAB_AFTER_EACH_PLAYER = True   # close each profile tab when the player is finished (also Loc players)
 FIND_SHORTCUT = "^f"
 
 # Timeouts (seconds). Measured values from the v5 recordings in comments.
@@ -420,6 +456,13 @@ def finish_run_files(kind):
             add_loc_sheet(check, loc_rows, RUN_FILES.get("stopped_at"))
         except Exception as exc:
             log(f"Could not add the sheet '{LOC_SHEET}' to {Path(check).name}: {exc}")
+    if "plan" in RUN_FILES and check and Path(check).exists():
+        try:
+            jobs, notes, violations = RUN_FILES["plan"]
+            add_status_sheet(check, RUN_FILES.get("sources", {}),
+                             (jobs, notes, violations, RUN_FILES.get("results", [])))
+        except Exception as exc:
+            log(f"Could not add the sheet '{STATUS_SHEET}' to {Path(check).name}: {exc}")
     log(bar)
     if kind is None:
         log(f"NO ERROR. Logs: {target}")
@@ -429,6 +472,9 @@ def finish_run_files(kind):
         log(f"{'ERROR' if kind == ERROR_FOLDER else 'VIOLATION in the Excel file'} - please check: {target}")
         for line in problems or ["see the log file in that folder"]:
             log(f"  {line}")
+    if check and "plan" in RUN_FILES:
+        log(f"Status of every Excel row (DONE / NOT DONE + reason): sheet '{STATUS_SHEET}' in "
+            f"{target / Path(check).name}")
     if loc_rows:
         log("-" * 78)
         log(f"LOC PLAYERS - NOT PROCESSED, please do them by hand ({len(loc_rows)}): "
@@ -588,6 +634,38 @@ def read_plan(today):
             workflow = "COSMO_SLOT" if allocation == "slot" else "COSMO_BBR"
             jobs[workflow].append({"workflow": workflow, "sheet": DAILY_SHEET, "excel_row": row,
                                    "player_id": pid, "amount": original_excel_text(amount_value)})
+        if MONTHLY_SHEET not in wb.sheetnames:
+            notes.append({"sheet": MONTHLY_SHEET, "row": "", "player_id": "",
+                          "note": f"sheet '{MONTHLY_SHEET}' not found - nothing to do for Monthly Benefit"})
+        else:
+            for row, (pid_value, amount_value, allocation_value) in sheet_rows(wb, MONTHLY_SHEET, MONTHLY_COLUMNS):
+                pid = original_excel_text(pid_value)
+                allocation = " ".join(str(allocation_value or "").split()).casefold()
+                try:
+                    amount = parse_amount(amount_value)
+                except (TypeError, ValueError):
+                    violations.append({"rule": "Invalid amount", "sheet": MONTHLY_SHEET, "rows": str(row),
+                                       "player_id": pid, "detail": f"MONTHLY FP check={amount_value!r}"})
+                    continue
+                if not pid:
+                    violations.append({"rule": "Missing Player ID", "sheet": MONTHLY_SHEET, "rows": str(row),
+                                       "player_id": "", "detail": f"MONTHLY FP check={amount_value!r}"})
+                    continue
+                if allocation not in MONTHLY_ALLOCATIONS:
+                    violations.append({"rule": "Unknown FP ALLOCATION", "sheet": MONTHLY_SHEET, "rows": str(row),
+                                       "player_id": pid, "detail": f"FP ALLOCATION={allocation_value!r}"})
+                    continue
+                if amount < 0:
+                    violations.append({"rule": "Negative amount", "sheet": MONTHLY_SHEET, "rows": str(row),
+                                       "player_id": pid, "detail": f"MONTHLY FP check={amount_value}"})
+                    continue
+                if amount == 0:
+                    notes.append({"sheet": MONTHLY_SHEET, "row": row, "player_id": pid,
+                                  "note": f"MONTHLY FP check is 0 ({allocation_value}) - skipped"})
+                    continue
+                workflow = MONTHLY_ALLOCATIONS[allocation]
+                jobs[workflow].append({"workflow": workflow, "sheet": MONTHLY_SHEET, "excel_row": row,
+                                       "player_id": pid, "amount": original_excel_text(amount_value)})
     finally:
         wb.close()
 
@@ -595,7 +673,8 @@ def read_plan(today):
         return [j["excel_row"] for j in jobs[workflow] if j["player_id"] == pid]
 
     for first, second, sheet in (("REBATE_SLOT", "REBATE_BBR", REBATE_SHEET),
-                                 ("COSMO_SLOT", "COSMO_BBR", DAILY_SHEET)):
+                                 ("COSMO_SLOT", "COSMO_BBR", DAILY_SHEET),
+                                 ("MONTHLY_SLOT", "MONTHLY_BBR", MONTHLY_SHEET)):
         for workflow in (first, second):
             seen = {}
             for job in jobs[workflow]:
@@ -626,6 +705,124 @@ def read_plan(today):
     for job in ordered:
         job.update(job_details(job["workflow"], today))
     return ordered, notes, violations
+
+
+def read_source_tables():
+    """Every non-empty row of the three sheets, all columns as in Excel: {sheet: (headers, [(row, values)])}."""
+    tables = {}
+    if not EXCEL_FILE.exists():
+        return tables
+    wb = load_workbook(EXCEL_FILE, data_only=True, read_only=True)
+    try:
+        for name in SOURCE_SHEETS:
+            if name not in wb.sheetnames:
+                continue
+            rows = wb[name].iter_rows(values_only=True)
+            headers = list(next(rows, None) or ())
+            while headers and (headers[-1] is None or str(headers[-1]).strip() == ""):
+                headers.pop()
+            data = []
+            for excel_row, row in enumerate(rows, start=2):
+                values = [row[i] if i < len(row) else None for i in range(len(headers))]
+                if any(v is not None and str(v).strip() != "" for v in values):
+                    data.append((excel_row, values))
+            tables[name] = (headers, data)
+    finally:
+        wb.close()
+    return tables
+
+
+STATUS_SHEET = "STATUS"
+STATUS_FILLS = {"DONE": "C6EFCE", "NOT DONE": "FFC7CE", "CHECK IN PM": "FFEB9C", "NOTHING TO DO": "EDEDED"}
+
+
+def row_status(sheet, excel_row, plan):
+    """(status, note) of one Excel row, from the plan and the results of this run."""
+    jobs, notes, violations, results = plan
+    for v in violations:
+        if v["sheet"] == sheet and str(excel_row) in [x.strip() for x in str(v["rows"]).split(",")]:
+            return "NOT DONE", f"Excel violation: {v['rule']} - {v['detail']}. The run stopped before PM."
+    row_jobs = [j for j in jobs if j["sheet"] == sheet and j["excel_row"] == excel_row]
+    if not row_jobs:
+        skipped = [n["note"] for n in notes if n["sheet"] == sheet and str(n["row"]) == str(excel_row)]
+        return "NOTHING TO DO", "; ".join(skipped) or "nothing to issue for this row"
+    parts, statuses = [], []
+    for job in row_jobs:
+        wf = WORKFLOWS[job["workflow"]]
+        what = f"{'Slot coupon' if wf['kind'] == 'coupon' else 'BBR'} {job['amount']}"
+        record = next((r for r in results if r["sheet"] == sheet and r["excel_row"] == excel_row
+                       and r["workflow"] == job["workflow"]), None)
+        status = record["status"] if record else ""
+        if status == "DONE":
+            check = record.get("confirmation_check", "")
+            statuses.append("DONE")
+            parts.append(f"{what}: done" + (f" (confirmation note: {check})" if check not in ("", "OK") else ""))
+        elif status == "SKIPPED_ALREADY_DONE":
+            statuses.append("DONE")
+            parts.append(f"{what}: done earlier today (pm_redeemed_ledger.csv)")
+        elif status == "TEST_CANCELLED":
+            statuses.append("NOT DONE")
+            parts.append(f"{what}: test run only - filled and cancelled, no OK")
+        elif status == "SKIPPED_LOC":
+            statuses.append("NOT DONE")
+            parts.append(f"{what}: Loc player '{record.get('identification', '')}' - do it by hand")
+        elif status == "ERROR_AFTER_OK":
+            statuses.append("CHECK IN PM")
+            parts.append(f"{what}: OK was clicked, then an error at {record['failed_step']} - check in PM: "
+                         f"{record['message'].split(' | screen:')[0][:200]}")
+        elif status.startswith("ERROR"):
+            statuses.append("NOT DONE")
+            parts.append(f"{what}: error at {record['failed_step']}: {record['message'].split(' | screen:')[0][:200]}")
+        else:
+            statuses.append("NOT DONE")
+            stopped = RUN_FILES.get("stopped_at")
+            parts.append(f"{what}: not processed" + (f" - the run stopped at #{stopped}" if stopped
+                                                     else " - the run did not reach this row"))
+    for status in ("CHECK IN PM", "NOT DONE", "DONE"):
+        if status in statuses:
+            return status, " | ".join(parts)
+    return "NOT DONE", " | ".join(parts)
+
+
+def add_status_sheet(path, tables, plan):
+    """Sheet STATUS: REBATE / DAILY REWARDS / MONTHLY BNF side by side (2 empty columns between them),
+    every Excel row with all its columns plus Status (DONE / NOT DONE / CHECK IN PM / NOTHING TO DO) and Note."""
+    from openpyxl.styles import Font, PatternFill
+    from openpyxl.utils import get_column_letter
+    wb = load_workbook(path)
+    if STATUS_SHEET in wb.sheetnames:
+        del wb[STATUS_SHEET]
+    sheet = wb.create_sheet(STATUS_SHEET, 0)
+    bold = Font(bold=True)
+    column = 1
+    for name in SOURCE_SHEETS:
+        headers, data = tables.get(name, ([], []))
+        headers = ["Excel row"] + [str(h) if h is not None else "" for h in headers] + ["Status", "Note"]
+        counts = {}
+        rows = []
+        for excel_row, values in data:
+            status, note = row_status(name, excel_row, plan)
+            counts[status] = counts.get(status, 0) + 1
+            rows.append([excel_row] + list(values) + [status, note])
+        title = f"{name}: " + (", ".join(f"{n} {s}" for s, n in counts.items()) if name in tables
+                               else "sheet not found")
+        sheet.cell(row=1, column=column, value=title).font = bold
+        for offset, header in enumerate(headers):
+            sheet.cell(row=2, column=column + offset, value=header).font = bold
+        for r, values in enumerate(rows, start=3):
+            for offset, value in enumerate(values):
+                sheet.cell(row=r, column=column + offset, value=value)
+            fill = STATUS_FILLS.get(values[-2])
+            if fill:
+                for offset in (len(values) - 2, len(values) - 1):
+                    sheet.cell(row=r, column=column + offset).fill = PatternFill("solid", fgColor=fill)
+        for offset, header in enumerate(headers):
+            width = 60 if header == "Note" else max(10, min(24, len(header) + 2))
+            sheet.column_dimensions[get_column_letter(column + offset)].width = width
+        column += len(headers) + 2          # two empty columns between the tables
+    sheet.freeze_panes = "A3"
+    wb.active = 0
+    wb.save(path)
 
 
 def write_check_file(jobs, notes, violations):
@@ -2294,6 +2491,21 @@ def close_tab_until_gone(pm, step, tab, what):
                   same_screen=screen_is((), main_enabled=True), target=tab)
 
 
+def close_job_tab(pm, progress, player_id):
+    """Close the player's profile tab right after the player is finished (done, cancelled or Loc)."""
+    tab = progress["tab"]
+    if not pm.exists(tab):
+        return
+    step = begin_step(progress, "15_close_profile_tab")
+    check_state(pm, step, popups=(), main_enabled=True)
+    title = pm.window_title(tab)
+    if not title_has_player(title, player_id):
+        raise StepError(step, f"tab #{tab} is '{title}', not player {player_id}; not closed.")
+    close_tab_until_gone(pm, step, tab, f"close the tab of {player_id}")
+    wait_state(pm, step, popups=(), main_enabled=True, timeout=T_TAB_CLOSE, quiet=0.5,
+               what="PM idle after closing the tab")
+
+
 def close_profile_tabs(pm, tabs):
     step = "13_close_profile_tabs"
     log(f"Closing {len(tabs)} profile tab(s) opened by this run.")
@@ -2342,6 +2554,28 @@ def ledger_append(job, status):
                          "status": status, "sheet": job["sheet"], "excel_row": job["excel_row"]})
 
 
+def ask_monthly_comment(jobs, today):
+    """Show the Monthly Benefit BBR comment; Enter keeps it, or type another one for all those rows."""
+    monthly = [j for j in jobs if j["workflow"] == "MONTHLY_BBR"]
+    if not monthly:
+        return True
+    suggested, standard = monthly_comment(today)
+    print("\n" + "=" * 78)
+    if not standard:
+        print(f"WARNING: today ({today:%m/%d/%Y}) is not the 1st or the 15th of the month.")
+        print(f"The Monthly Benefit comment would normally be for the 1st or the 15th; suggested: '{suggested}'.")
+    print(f"Comment for the {len(monthly)} Monthly Benefit BBR row(s): '{suggested}'")
+    answer = input("Press Enter to use it for all of them, or type another comment: ").strip()
+    comment = answer or suggested
+    if not comment:
+        return False
+    for job in monthly:
+        job["comment"] = comment
+    log(f"Monthly Benefit BBR comment: '{comment}'" + (" (typed by the user)" if answer else "")
+        + ("" if standard else f" - today is not the 1st or the 15th, suggested was '{suggested}'"))
+    return True
+
+
 def ask_allow_ok(jobs):
     print("\n" + "=" * 78)
     for workflow in WORKFLOW_ORDER:
@@ -2382,6 +2616,7 @@ def run(pm, jobs, username, password, allow_ok=False, today=None):
         f"today = {today:%m/%d/%Y}")
     done_today = ledger_done_today() if allow_ok else set()
     results = []
+    RUN_FILES["results"] = results   # for the STATUS sheet
     RUN_FILES["loc"] = []            # SKIPPED_LOC rows, to be done by hand
     RUN_FILES.pop("stopped_at", None)
     tabs = []
@@ -2459,6 +2694,19 @@ def run(pm, jobs, username, password, allow_ok=False, today=None):
             log(f"Log file: {LOG_FILE}")
             return 1
         log(f"#{wf['no']} player {job['player_id']}: {record['status']} in {record['duration_s']}s")
+        if CLOSE_TAB_AFTER_EACH_PLAYER and progress.get("tab"):
+            try:
+                close_job_tab(pm, progress, job["player_id"])
+                tabs.remove((progress["tab"], job["player_id"]))
+            except ValueError:
+                pass
+            except Exception as exc:
+                step = getattr(exc, "step", progress["step"])
+                log(f"STOPPED while closing the tab of {job['player_id']} at {step}: {exc}")
+                RUN_FILES["stopped_at"] = index
+                note_problem(f"#{index} player {job['player_id']}: closing the profile tab failed: {exc}")
+                save_screens(pm, step, "stopped", getattr(exc, "hwnd", None), everything=True)
+                return 1
 
     if CLOSE_TABS_AT_END:
         try:
@@ -2509,6 +2757,11 @@ def run_main(username, password):
     log(f"Runner {RUNNER_VERSION}, control mode: {CONTROL_MODE}")
     log(f"Log folder: {RUN_FILES.get('dir', BASE_DIR)}")
     jobs, notes, violations = read_plan(today)
+    RUN_FILES["plan"] = (jobs, notes, violations)
+    try:
+        RUN_FILES["sources"] = read_source_tables()
+    except Exception as exc:
+        log(f"Could not read the Excel rows for the STATUS sheet: {exc}")
     check_file = write_check_file(jobs, notes, violations)
     log(f"Excel check written to {check_file.name}: {len(jobs)} job(s), {len(notes)} note(s), "
         f"{len(violations)} violation(s)")
@@ -2524,6 +2777,11 @@ def run_main(username, password):
         log("Nothing to do.")
         write_log([])
         return 0
+    if not ask_monthly_comment(jobs, today):
+        log("STOPPED: no comment for the Monthly Benefit BBR rows.")
+        note_problem("no comment for the Monthly Benefit BBR rows")
+        return 1
+    write_check_file(jobs, notes, violations)       # the PLAN shows the comment that will be used
     allow_ok = ask_allow_ok(jobs)
     pm = Win32PM()
     pm.connect()
