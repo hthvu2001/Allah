@@ -40,6 +40,12 @@ only noted when they differ (the coupon is confirmed anyway). OK clicks are
 written to pm_redeemed_ledger.csv per player and workflow, and a rerun on the
 same day skips them. The first error stops the run and leaves PM as it is.
 
+Files of a run go to <yyyymmdd>-automation-log/ (text log, CSV log, Excel check,
+screenshots, all named with the run time); after an error they are moved to its
+"error" sub-folder, after an Excel violation to "violation", and the end of the
+terminal says "ERROR - please check: <folder>" or "NO ERROR". The OK ledger stays
+next to the script.
+
 Control: CONTROL_MODE = "background" drives PM with Win32 messages and UIA
 Invoke only (no mouse, no keyboard, no focus). Controls are found by their
 control IDs, never by screen coordinates.
@@ -48,6 +54,7 @@ control IDs, never by screen coordinates.
 import csv
 import ctypes
 import re
+import shutil
 import struct
 import zlib
 import sys
@@ -71,7 +78,7 @@ try:
 except ImportError:  # lets the step logic be imported and tested off Windows
     win32con = win32gui = win32process = None
 
-RUNNER_VERSION = "4.6-four-workflows"
+RUNNER_VERSION = "4.7-four-workflows"
 BASE_DIR = Path(__file__).resolve().parent
 EXCEL_FILE = BASE_DIR / "Excel-for-auto.xlsx"
 LOG_FILE = BASE_DIR / "pm_automation_log.csv"
@@ -112,7 +119,13 @@ FIND_PLAYER_COMMAND_ID = None     # None: found automatically from PM's Ctrl+F a
 FIND_ACCELERATOR = (ord("F"), "CTRL")
 REDEEM_COUPON_COMMAND_ID = None
 REDEEM_ACCELERATOR = (0x7B, None)   # F12 opens Coupon Redemption on a profile (recording 09/29)
-LEDGER_FILE = BASE_DIR / "pm_redeemed_ledger.csv"
+LEDGER_FILE = BASE_DIR / "pm_redeemed_ledger.csv"      # stays here: it is read by every run of the day
+# Each run writes its text log, CSV log, Excel check and screenshots into
+# <BASE_DIR>/<yyyymmdd>-automation-log/. After an error they are moved to its "error"
+# sub-folder, after an Excel violation to "violation"; the terminal names the folder.
+LOG_DIR_SUFFIX = "-automation-log"
+ERROR_FOLDER = "error"
+VIOLATION_FOLDER = "violation"
 SCREENSHOTS = True               # save pictures of PM when a try fails and when the run stops
 SCREENSHOT_DIR = BASE_DIR / "pm_screenshots"
 SCREENSHOT_MARGIN = 40           # pixels around the control in the close-up picture
@@ -327,6 +340,69 @@ def region_colors(image, x0, y0, x1, y1):
             "text_rgb": "#%02x%02x%02x" % text if text else "", "background_rgb": "#%02x%02x%02x" % background}
 
 
+RUN_FILES = {}      # dir, stamp, check, problems of the current run (set by start_run_files)
+
+
+def start_run_files(now=None):
+    """Point this run's text log, CSV log and screenshots at <yyyymmdd>-automation-log/."""
+    global LOG_FILE, TEXT_LOG_FILE
+    now = now or datetime.now()
+    day_dir = BASE_DIR / f"{now:%Y%m%d}{LOG_DIR_SUFFIX}"
+    day_dir.mkdir(parents=True, exist_ok=True)
+    stamp = f"{now:%Y%m%d_%H%M%S}"
+    RUN_FILES.clear()
+    RUN_FILES.update(dir=day_dir, stamp=stamp, problems=[])
+    TEXT_LOG_FILE = day_dir / f"pm_runner_log_{stamp}.txt"
+    LOG_FILE = day_dir / f"pm_automation_log_{stamp}.csv"
+    _screens["dir"] = day_dir / f"pm_screenshots_{stamp}"
+    _screens["count"] = 0
+    return day_dir
+
+
+def note_problem(text):
+    """One line for the error / violation summary printed at the end of the run."""
+    RUN_FILES.setdefault("problems", []).append(text)
+
+
+def finish_run_files(kind):
+    """Print the result; after an error / violation move this run's files into that sub-folder.
+
+    kind: None (no error), ERROR_FOLDER or VIOLATION_FOLDER. Returns the folder to look at.
+    """
+    global LOG_FILE, TEXT_LOG_FILE
+    day_dir = RUN_FILES.get("dir")
+    if day_dir is None:
+        return None
+    problems = RUN_FILES.get("problems") or []
+    bar = "=" * 78
+    target = day_dir / kind if kind else day_dir
+    log(bar)
+    if kind is None:
+        log(f"NO ERROR. Logs: {target}")
+        for line in problems:
+            log(f"  note: {line}")
+        log(bar)
+        return target
+    log(f"{'ERROR' if kind == ERROR_FOLDER else 'VIOLATION in the Excel file'} - please check: {target}")
+    for line in problems or ["see the log file in that folder"]:
+        log(f"  {line}")
+    log(bar)
+    target.mkdir(parents=True, exist_ok=True)
+    moved = {}
+    for path in (TEXT_LOG_FILE, LOG_FILE, RUN_FILES.get("check"), _screens.get("dir")):
+        if not path or not Path(path).exists():
+            continue
+        try:
+            destination = target / Path(path).name
+            shutil.move(str(path), str(destination))
+            moved[str(path)] = destination
+        except OSError as exc:
+            print(f"  (could not move {Path(path).name} into {target}: {exc})")
+    TEXT_LOG_FILE = moved.get(str(TEXT_LOG_FILE), TEXT_LOG_FILE)
+    LOG_FILE = moved.get(str(LOG_FILE), LOG_FILE)
+    return target
+
+
 def log(message):
     line = f"[{datetime.now().strftime('%H:%M:%S')}] {message}"
     print(line, flush=True)
@@ -502,7 +578,11 @@ def read_plan(today):
 
 
 def write_check_file(jobs, notes, violations):
-    path = BASE_DIR / f"pm_excel_check_{datetime.now():%Y%m%d_%H%M%S}.xlsx"
+    if RUN_FILES.get("dir"):
+        path = RUN_FILES["dir"] / f"pm_excel_check_{RUN_FILES['stamp']}.xlsx"
+        RUN_FILES["check"] = path
+    else:
+        path = BASE_DIR / f"pm_excel_check_{datetime.now():%Y%m%d_%H%M%S}.xlsx"
     wb = Workbook()
     plan = wb.active
     plan.title = "PLAN"
@@ -782,6 +862,16 @@ class Win32PM:
             win32gui.ShowWindow(self.main, win32con.SW_SHOWNOACTIVATE)
             log("PM was minimized: restored without taking focus.")
             time.sleep(0.5)
+
+    def focus_in_dialog(self, dialog, control):
+        """Move the dialog's own focus to a control (WM_NEXTDLGCTL), as a real click on it does.
+
+        Only PM's focus inside its dialog changes; the foreground window, the keyboard and the
+        mouse of the user do not. Some dialogs treat OK like Enter in a field ("go to the next
+        field") unless the OK button has the focus; with it, OK is handled as a real OK.
+        """
+        if background_mode():
+            self._send(dialog, win32con.WM_NEXTDLGCTL, control, 1)
 
     def focus(self, hwnd):
         if background_mode():
@@ -1460,6 +1550,12 @@ def click(pm, step, popup, control_id, what, allow_ok=False, expect=None):
     if allowed is not None and control_id not in allowed | ({ID_OK} if allow_ok else set()):
         raise StepError(step, f"Safety stop: refusing to click control id={control_id} in {popup.title}.")
     hwnd = control(pm, step, popup, control_id, what, expect=expect)
+    if control_id == ID_OK and allow_ok and hasattr(pm, "focus_in_dialog"):
+        try:
+            pm.focus_in_dialog(popup.hwnd, hwnd)
+            log(f"  [{step}] {what}: the OK button gets the dialog's focus first (as with a real click)")
+        except Exception as exc:
+            log(f"  [{step}] {what}: could not give the OK button the focus ({exc}); clicking anyway")
     log(f"  [{step}] click {what} (id={control_id}" + (f", '{expect}'" if expect else "") + ")")
     pm.click(hwnd)
     return hwnd
@@ -2240,6 +2336,7 @@ def run(pm, jobs, username, password, allow_ok=False, today=None):
         ensure_logged_in(pm, username, password)
     except Exception as exc:
         log(f"STOPPED at login: {exc}")
+        note_problem(f"login: {exc}")
         write_log(results)
         return 1
 
@@ -2296,6 +2393,12 @@ def run(pm, jobs, username, password, allow_ok=False, today=None):
             tabs.append((progress["tab"], job["player_id"]))
         if record["status"].startswith("ERROR"):
             log(f"#{wf['no']} player {job['player_id']}: ERROR at {record['failed_step']}: {record['message']}")
+            note_problem(f"#{index} {job['workflow']} player {job['player_id']} ({job['sheet']} row "
+                         f"{job['excel_row']}) {record['status']} at {record['failed_step']}: "
+                         f"{record['message'].split(' | screen:')[0][:300]}")
+            if record["status"] == "ERROR_AFTER_OK":
+                note_problem("OK was already clicked for this row: check it in PM before running again "
+                             "(a rerun today skips it, see pm_redeemed_ledger.csv)")
             log("STOPPED. PM is left exactly as it is for inspection; no cleanup was done.")
             log(f"Log file: {LOG_FILE}")
             return 1
@@ -2306,6 +2409,7 @@ def run(pm, jobs, username, password, allow_ok=False, today=None):
             close_profile_tabs(pm, tabs)
         except Exception as exc:
             log(f"STOPPED while closing tabs at {getattr(exc, 'step', 'close_tabs')}: {exc}")
+            note_problem(f"closing the profile tabs: {exc}")
             save_screens(pm, getattr(exc, "step", "close_tabs"), "stopped", getattr(exc, "hwnd", None),
                          everything=True)
             return 1
@@ -2317,6 +2421,8 @@ def run(pm, jobs, username, password, allow_ok=False, today=None):
     if noted:
         log(f"Coupon confirmation notes on {len(noted)} row(s) (column confirmation_check): "
             + ", ".join(f"#{row['order']} player {row['player_id']}" for row in noted))
+        for row in noted:
+            note_problem(f"#{row['order']} player {row['player_id']} coupon confirmation: {row['confirmation_check']}")
     log(f"Log file: {LOG_FILE}")
     return 0
 
@@ -2327,8 +2433,25 @@ def main():
     except ImportError as exc:
         raise SystemExit("Missing pm_credentials.py in the same folder.") from exc
 
+    start_run_files()
+    try:
+        code = run_main(PM_USERNAME, PM_PASSWORD)
+    except KeyboardInterrupt:
+        log("STOPPED with Ctrl+C. PM is left as it is.")
+        note_problem("stopped with Ctrl+C")
+        code = 1
+    except Exception as exc:
+        log(f"[FATAL] {type(exc).__name__}: {exc}")
+        note_problem(f"{type(exc).__name__}: {exc}")
+        code = 1
+    finish_run_files(VIOLATION_FOLDER if code == 2 else ERROR_FOLDER if code else None)
+    return code
+
+
+def run_main(username, password):
     today = date.today()
     log(f"Runner {RUNNER_VERSION}, control mode: {CONTROL_MODE}")
+    log(f"Log folder: {RUN_FILES.get('dir', BASE_DIR)}")
     jobs, notes, violations = read_plan(today)
     check_file = write_check_file(jobs, notes, violations)
     log(f"Excel check written to {check_file.name}: {len(jobs)} job(s), {len(notes)} note(s), "
@@ -2338,6 +2461,7 @@ def main():
     if violations:
         for v in violations:
             log(f"  VIOLATION {v['rule']}: {v['sheet']} rows {v['rows']} player {v['player_id']} - {v['detail']}")
+            note_problem(f"{v['rule']}: player {v['player_id']} ({v['sheet']} rows {v['rows']}) - {v['detail']}")
         log("STOPPED before touching PM. Fix the Excel file (see the VIOLATIONS sheet) and run again.")
         return 2
     if not jobs:
@@ -2347,7 +2471,7 @@ def main():
     allow_ok = ask_allow_ok(jobs)
     pm = Win32PM()
     pm.connect()
-    return run(pm, jobs, PM_USERNAME, PM_PASSWORD, allow_ok, today)
+    return run(pm, jobs, username, password, allow_ok, today)
 
 
 if __name__ == "__main__":
