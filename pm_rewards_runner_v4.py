@@ -25,6 +25,9 @@ Reads Excel-for-auto.xlsx and runs, in this order (rows in Excel order):
 After the run the Excel check file gets a STATUS sheet (the three sheets side by
 side, every row with Status + Note) and a "Loc players to check" sheet. Each
 profile tab is closed as soon as its player is finished (Loc players too).
+PM's "Application Timeout" logoff countdown (PM only counts real keyboard/mouse
+input) is closed with Cancel whenever it appears, and the step goes on. At the
+end the runner offers to open the Excel check file.
 
 Before touching PM the Excel is checked and a report pm_excel_check_<time>.xlsx
 is written (PLAN, NOTES, VIOLATIONS). The run stops if there is any violation:
@@ -64,6 +67,7 @@ control IDs, never by screen coordinates.
 
 import csv
 import ctypes
+import os
 import re
 import shutil
 import struct
@@ -89,7 +93,7 @@ try:
 except ImportError:  # lets the step logic be imported and tested off Windows
     win32con = win32gui = win32process = None
 
-RUNNER_VERSION = "4.9-six-workflows"
+RUNNER_VERSION = "4.10-six-workflows"
 BASE_DIR = Path(__file__).resolve().parent
 EXCEL_FILE = BASE_DIR / "Excel-for-auto.xlsx"
 LOG_FILE = BASE_DIR / "pm_automation_log.csv"
@@ -235,6 +239,10 @@ LOGIN, FIND, SYSMSG, COMMENT, COUPON, ADJUST, MENU, DROPDOWN, UNKNOWN = (
 #   1034 "Mr. GEONWOO KIM", 3733 "Redemption Information",
 #   1502 "The coupon will reward the player with $645.00 in SLOTS.", OK (1) / Cancel (2)
 COUPON_CONFIRM = "COUPON_CONFIRM"
+# PM counts only real keyboard / mouse input as activity: during a long background run it shows
+# "Application Timeout" - "The system will logoff in 10 second(s)." with a Cancel button.
+APP_TIMEOUT = "APP_TIMEOUT"
+T_APP_TIMEOUT_CLOSE = 3
 CONFIRM_NAME_ID = 1034
 CONFIRM_TEXT_ID = 1502
 CONFIRM_TEXT_RE = re.compile(r"reward the player with \$\s*([\d,]+(?:\.\d+)?)\s+in\s+(\w+)", re.I)
@@ -246,6 +254,7 @@ DIALOG_TITLES = {
     "player comment": COMMENT,
     "coupon redemption": COUPON,
     "player adjustment": ADJUST,
+    "application timeout": APP_TIMEOUT,
 }
 LOGIN_TITLE_RE = re.compile(r"^Patron Management\s+(?:Log\s*on|Log\s*in)$", re.I)
 MAIN_TITLE_RE = re.compile(r"^Patron Management(?: - .+)?$")
@@ -472,6 +481,8 @@ def finish_run_files(kind):
         log(f"{'ERROR' if kind == ERROR_FOLDER else 'VIOLATION in the Excel file'} - please check: {target}")
         for line in problems or ["see the log file in that folder"]:
             log(f"  {line}")
+    if _app_timeout["count"]:
+        log(f"PM 'Application Timeout' (logoff countdown) was closed {_app_timeout['count']} time(s) with Cancel.")
     if check and "plan" in RUN_FILES:
         log(f"Status of every Excel row (DONE / NOT DONE + reason): sheet '{STATUS_SHEET}' in "
             f"{target / Path(check).name}")
@@ -497,7 +508,28 @@ def finish_run_files(kind):
             print(f"  (could not move {Path(path).name} into {target}: {exc})")
     TEXT_LOG_FILE = moved.get(str(TEXT_LOG_FILE), TEXT_LOG_FILE)
     LOG_FILE = moved.get(str(LOG_FILE), LOG_FILE)
+    if check:
+        RUN_FILES["check"] = moved.get(str(check), check)
     return target
+
+
+def ask_open_check_file():
+    """At the end: offer to open pm_excel_check_<time>.xlsx (STATUS, Loc players, PLAN...)."""
+    path = RUN_FILES.get("check")
+    if not path or not Path(path).exists():
+        return
+    try:
+        answer = input(f"\nOpen {Path(path).name} now? [Y/n]: ").strip().casefold()
+    except (EOFError, KeyboardInterrupt):
+        return
+    if answer not in ("", "y", "yes"):
+        return
+    try:
+        os.startfile(str(path))          # Windows: opens it in Excel
+    except AttributeError:
+        print(f"Open it from: {path}")
+    except OSError as exc:
+        print(f"Could not open {path}: {exc}")
 
 
 def log(message):
@@ -804,8 +836,8 @@ def add_status_sheet(path, tables, plan):
             status, note = row_status(name, excel_row, plan)
             counts[status] = counts.get(status, 0) + 1
             rows.append([excel_row] + list(values) + [status, note])
-        title = f"{name}: " + (", ".join(f"{n} {s}" for s, n in counts.items()) if name in tables
-                               else "sheet not found")
+        title = f"{name}: " + ((", ".join(f"{n} {s}" for s, n in counts.items()) or "no rows")
+                               if name in tables else "sheet not found")
         sheet.cell(row=1, column=column, value=title).font = bold
         for offset, header in enumerate(headers):
             sheet.cell(row=2, column=column + offset, value=header).font = bold
@@ -1456,6 +1488,17 @@ class Win32PM:
     def close_tab(self, hwnd):
         win32gui.PostMessage(hwnd, win32con.WM_SYSCOMMAND, win32con.SC_CLOSE, 0)
 
+    def find_button(self, parent, text):
+        """A button of a dialog found by its caption (without '&'), for dialogs never recorded."""
+        for hwnd in self._children(parent):
+            try:
+                if "button" in win32gui.GetClassName(hwnd).casefold() and \
+                        self.text(hwnd).replace("&", "").strip().casefold() == text.casefold():
+                    return hwnd
+            except win32gui.error:
+                continue
+        return None
+
     def _children(self, hwnd):
         found = []
         try:
@@ -1524,11 +1567,51 @@ class Win32PM:
 
 # ------------------------------------------------------ gates (pre/post)
 
+_app_timeout = {"closing": False, "count": 0}
+
+
 def read_state(pm):
+    """PM's current state. An 'Application Timeout' logoff countdown is closed (Cancel) on the spot,
+    whatever the runner is doing, so the step goes on as if it had not been there."""
     ensure_shown = getattr(pm, "ensure_shown", None)
     if ensure_shown:
         ensure_shown()
-    return PMState(pm.main_title(), pm.main_enabled(), pm.popups())
+    state = PMState(pm.main_title(), pm.main_enabled(), pm.popups())
+    if not _app_timeout["closing"]:
+        countdown = state.get(APP_TIMEOUT)
+        if countdown is not None:
+            close_app_timeout(pm, countdown)
+            state = PMState(pm.main_title(), pm.main_enabled(), pm.popups())
+    return state
+
+
+def close_app_timeout(pm, popup):
+    """Click Cancel in PM's 'Application Timeout' ("The system will logoff in 10 second(s).")."""
+    _app_timeout["closing"] = True
+    try:
+        text = pm.describe(popup.hwnd)
+        cancel = pm.child(popup.hwnd, ID_CANCEL)
+        if (not cancel or caption(pm, cancel).casefold() != "cancel") and hasattr(pm, "find_button"):
+            cancel = pm.find_button(popup.hwnd, "Cancel")     # the ID of this button was never recorded
+        if not cancel or caption(pm, cancel).casefold() != "cancel":
+            raise StepError("app_timeout", f"PM shows 'Application Timeout' but its Cancel button was not found: {text}")
+        log(f"  PM 'Application Timeout' is open ({text}): clicking Cancel to stay logged in")
+        for attempt in range(1, MAX_ATTEMPTS + 1):
+            if pm.visible(popup.hwnd):
+                pm.click(cancel)
+            if wait_until(lambda: not pm.visible(popup.hwnd), T_APP_TIMEOUT_CLOSE):
+                if any(p.kind == LOGIN for p in pm.popups()):
+                    raise StepError("app_timeout", "PM logged off: the 'Application Timeout' countdown ended "
+                                                   "before Cancel took effect")
+                _app_timeout["count"] += 1
+                log(f"  'Application Timeout' closed (Cancel){'' if attempt == 1 else f' on try {attempt}'}; "
+                    f"going on with the current step")
+                time.sleep(0.3)
+                return
+            log(f"  'Application Timeout' still open, clicking Cancel again ({attempt + 1}/{MAX_ATTEMPTS})")
+        raise StepError("app_timeout", f"PM 'Application Timeout' did not close with Cancel: {text}", cancel)
+    finally:
+        _app_timeout["closing"] = False
 
 
 def state_problem(state, popups, main_enabled, player_id):
@@ -2749,6 +2832,7 @@ def main():
         note_problem(f"{type(exc).__name__}: {exc}")
         code = 1
     finish_run_files(VIOLATION_FOLDER if code == 2 else ERROR_FOLDER if code else None)
+    ask_open_check_file()
     return code
 
 
