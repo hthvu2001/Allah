@@ -18,9 +18,15 @@ Reads Excel-for-auto.xlsx and runs, in this order (rows in Excel order):
                   Coupon Redemption (F12) > Competitor Coupon > MBS FP - 7 > Amount > OK > confirmation > OK
   #6 MONTHLY_BBR  sheet MONTHLY BNF, FP ALLOCATION = BBR BUCKET
                   Rewards: BBR > Adjust > Add BBR, Adjustment, Expiration = today + 14 days
-                  05:59 AM, Reason "G) MBS FP", Comment "MONTHLY BENEFIT - 30SEP2026" (run on the 1st:
-                  last day of the previous month; on the 15th: 15<MON><YYYY>; other days: the user is
-                  asked). The comment is shown at the start: Enter keeps it, or type another one.
+                  05:59 AM, Reason "G) MBS FP", Comment "MONTHLY BENEFIT - 01OCT2026" (run on the 1st:
+                  01<MON><YYYY>; on the 15th: 15<MON><YYYY>; other days: the user is asked). The
+                  comment is shown at the start: Enter keeps it, or type another one.
+
+Daily coupon limit: when PM says "You have exceeded your daily redemption limits ... override?"
+the runner answers No (coupon not issued), cancels the redemption and asks the user in a popup
+whether the Slot rows go on with Rewards > SLOTS > Adjust > Add SLOTS (Reason / Expiration /
+Comment of the BBR rows of the same sheet). Yes: this row and every later Slot row; No: the
+Slot rows are NOT DONE and the BBR rows go on.
 
 After the run the Excel check file gets a STATUS sheet (the three sheets side by
 side, every row with Status + Note) and a "Loc players to check" sheet. Each
@@ -93,7 +99,7 @@ try:
 except ImportError:  # lets the step logic be imported and tested off Windows
     win32con = win32gui = win32process = None
 
-RUNNER_VERSION = "4.10-six-workflows"
+RUNNER_VERSION = "4.11-six-workflows"
 BASE_DIR = Path(__file__).resolve().parent
 EXCEL_FILE = BASE_DIR / "Excel-for-auto.xlsx"
 LOG_FILE = BASE_DIR / "pm_automation_log.csv"
@@ -117,19 +123,13 @@ def rebate_comment(today):
 
 
 def monthly_comment(today):
-    """(comment, standard): the 15th -> 15<MON><YYYY>; the 1st -> last day of the previous month.
+    """(comment, standard): run on the 1st -> 01<MON><YYYY>, on the 15th -> 15<MON><YYYY> (this month).
 
-    Any other day is not a standard run day: the most recent of those two dates is suggested
-    and the user is asked (see ask_monthly_comment).
+    Any other day is not a standard run day: the latest of those two dates of this month is
+    suggested and the user is asked (see ask_monthly_comment).
     """
-    if today.day == 15:
-        stamp, standard = today, True
-    elif today.day == 1:
-        stamp, standard = today - timedelta(days=1), True
-    elif today.day > 15:
-        stamp, standard = today.replace(day=15), False
-    else:
-        stamp, standard = today.replace(day=1) - timedelta(days=1), False
+    standard = today.day in (1, 15)
+    stamp = today.replace(day=15 if today.day >= 15 else 1)
     return f"MONTHLY BENEFIT - {stamp.day:02d}{MONTHS[stamp.month - 1]}{stamp.year}", standard
 
 
@@ -214,6 +214,7 @@ COUPON_CLICKABLE_IDS = {COUPON_COMPETITOR_RADIO, COUPON_COMPETITOR_COMBO, COUPON
 REDEEM_MENU_ITEM = "Redeem Coupon..."
 REWARDS_FRAME_ID = 3924        # group box "Rewards" on the profile
 BBR_RADIO = 2351               # "BBR" in Rewards
+SLOTS_RADIO = 1128             # "SLOTS" in Rewards
 ADJUST_BUTTON = 1106           # "Adjust" in Rewards
 ADJ_HEADER = 1983              # "BBR Adjustment"
 ADJ_ADD_RADIO = 1053           # Add BBR (default)
@@ -239,6 +240,17 @@ LOGIN, FIND, SYSMSG, COMMENT, COUPON, ADJUST, MENU, DROPDOWN, UNKNOWN = (
 #   1034 "Mr. GEONWOO KIM", 3733 "Redemption Information",
 #   1502 "The coupon will reward the player with $645.00 in SLOTS.", OK (1) / Cancel (2)
 COUPON_CONFIRM = "COUPON_CONFIRM"
+# When the PM account has reached its daily coupon limit (about $20k), PM asks in a "Confirmation"
+# message box: "You have exceeded your daily redemption limits. An override will be required to
+# complete this transaction. Would you like to override the coupon redemption?" Yes / No.
+# The runner answers No (the coupon is not issued) and asks the user whether the Slot rows are to
+# be issued with Rewards > SLOTS > Adjust instead.
+LIMIT_CONFIRM = "REDEMPTION_LIMIT"
+LIMIT_TEXT_RE = re.compile(r"exceeded your daily redemption limit", re.I)
+ID_YES, ID_NO = 6, 7
+LEDGER_NOT_ISSUED = "NOT_ISSUED_LIMIT"     # ledger status: OK was clicked but PM refused the coupon
+FORCE_SLOTS_ADJUST = False                 # True: issue Slot rows with SLOTS Adjust from the start (to test it)
+SLOTS_ADJUST_SOURCE = {"REBATE_SLOT": "REBATE_BBR", "COSMO_SLOT": "COSMO_BBR", "MONTHLY_SLOT": "MONTHLY_BBR"}
 # PM counts only real keyboard / mouse input as activity: during a long background run it shows
 # "Application Timeout" - "The system will logoff in 10 second(s)." with a Cancel button.
 APP_TIMEOUT = "APP_TIMEOUT"
@@ -255,6 +267,7 @@ DIALOG_TITLES = {
     "coupon redemption": COUPON,
     "player adjustment": ADJUST,
     "application timeout": APP_TIMEOUT,
+    "confirmation": LIMIT_CONFIRM,          # only with the daily-limit text, otherwise UNKNOWN
 }
 LOGIN_TITLE_RE = re.compile(r"^Patron Management\s+(?:Log\s*on|Log\s*in)$", re.I)
 MAIN_TITLE_RE = re.compile(r"^Patron Management(?: - .+)?$")
@@ -785,16 +798,23 @@ def row_status(sheet, excel_row, plan):
         record = next((r for r in results if r["sheet"] == sheet and r["excel_row"] == excel_row
                        and r["workflow"] == job["workflow"]), None)
         status = record["status"] if record else ""
-        if status == "DONE":
+        if status == "DONE" and record.get("issued_by"):
+            statuses.append("DONE")
+            parts.append(f"{what}: done with {record['issued_by']} (daily coupon limit reached)")
+        elif status == "DONE":
             check = record.get("confirmation_check", "")
             statuses.append("DONE")
             parts.append(f"{what}: done" + (f" (confirmation note: {check})" if check not in ("", "OK") else ""))
+        elif status == "NOT_DONE_LIMIT":
+            statuses.append("NOT DONE")
+            parts.append(f"{what}: daily coupon limit reached - not issued (SLOTS Adjust declined); issue it by hand")
         elif status == "SKIPPED_ALREADY_DONE":
             statuses.append("DONE")
             parts.append(f"{what}: done earlier today (pm_redeemed_ledger.csv)")
         elif status == "TEST_CANCELLED":
             statuses.append("NOT DONE")
-            parts.append(f"{what}: test run only - filled and cancelled, no OK")
+            parts.append(f"{what}: test run only - filled and cancelled, no OK"
+                         + (f" ({record['issued_by']})" if record.get("issued_by") else ""))
         elif status == "SKIPPED_LOC":
             statuses.append("NOT DONE")
             parts.append(f"{what}: Loc player '{record.get('identification', '')}' - do it by hand")
@@ -1073,6 +1093,8 @@ class Win32PM:
                 kind = classify(title, cls)
                 if kind == COUPON and self.child(hwnd, CONFIRM_TEXT_ID):
                     kind = COUPON_CONFIRM
+                if kind == LIMIT_CONFIRM and not LIMIT_TEXT_RE.search(self.describe(hwnd)):
+                    kind = UNKNOWN
                 found.append(Popup(hwnd, title, cls, kind))
             except win32gui.error:
                 pass
@@ -1568,6 +1590,9 @@ class Win32PM:
 # ------------------------------------------------------ gates (pre/post)
 
 _app_timeout = {"closing": False, "count": 0}
+# mode: None (coupons), "adjust" (Slot rows with SLOTS Adjust), "skip" (Slot rows not done)
+COUPON_LIMIT = {"mode": None, "at": None, "adjusted": 0, "skipped": 0}
+RUN_SETTINGS = {"monthly_comment": None}
 
 
 def read_state(pm):
@@ -1877,7 +1902,8 @@ def control(pm, step, popup, control_id, what, need_enabled=True, timeout=T_VERI
 
 
 def click(pm, step, popup, control_id, what, allow_ok=False, expect=None):
-    allowed = {COUPON: COUPON_CLICKABLE_IDS, ADJUST: ADJUST_CLICKABLE_IDS, COUPON_CONFIRM: set()}.get(popup.kind)
+    allowed = {COUPON: COUPON_CLICKABLE_IDS, ADJUST: ADJUST_CLICKABLE_IDS, COUPON_CONFIRM: {ID_CANCEL},
+               LIMIT_CONFIRM: {ID_NO}}.get(popup.kind)
     if allowed is not None and control_id not in allowed | ({ID_OK} if allow_ok else set()):
         raise StepError(step, f"Safety stop: refusing to click control id={control_id} in {popup.title}.")
     hwnd = control(pm, step, popup, control_id, what, expect=expect)
@@ -2290,6 +2316,9 @@ def finish_coupon_ok(pm, step, job, progress, coupon):
     while True:
         state = read_state(pm)
         raise_on_unknown(pm, step, state, "waiting for the coupon confirmation")
+        if state.get(LIMIT_CONFIRM) is not None:
+            handle_coupon_limit(pm, step, job, progress, state.get(LIMIT_CONFIRM))
+            return
         confirm = state.get(COUPON_CONFIRM)
         if confirm is not None or (not pm.visible(coupon.hwnd) and state.get(COUPON) is None):
             break
@@ -2318,10 +2347,87 @@ def finish_coupon_ok(pm, step, job, progress, coupon):
         ledger_append(job, "CONFIRM_CLICKED")
         # Clicked exactly once, like the first OK.
         click(pm, step, confirm, ID_OK, "confirmation OK", allow_ok=True, expect="OK")
-        wait_popup_closed(pm, step, confirm, T_AFTER_OK)
+        deadline = time.time() + T_AFTER_OK
+        while True:
+            state = read_state(pm)
+            raise_on_unknown(pm, step, state, "waiting for the confirmation to close")
+            if state.get(LIMIT_CONFIRM) is not None:
+                handle_coupon_limit(pm, step, job, progress, state.get(LIMIT_CONFIRM))
+                return
+            if not pm.visible(confirm.hwnd):
+                log(f"  [{step}] {COUPON_CONFIRM} closed")
+                break
+            if time.time() > deadline:
+                raise StepError(step, f"{confirm.label()} did not close within {T_AFTER_OK}s. "
+                                      f"State: {state.summary()}", confirm.hwnd)
+            time.sleep(POLL)
     wait_state(pm, step, popups=(), main_enabled=True, player_id=player_id,
                timeout=T_AFTER_OK, quiet=1.0, what="PM idle after the redemption")
     ledger_append(job, "DONE")
+
+
+def handle_coupon_limit(pm, step, job, progress, limit):
+    """PM refuses the coupon (daily limit of the account): answer No, close what is left of the
+    redemption without issuing it, then ask the user (popup) whether the Slot rows go on with
+    SLOTS Adjust instead. Yes -> this row is issued with SLOTS Adjust now, and so are the next ones."""
+    step = begin_step(progress, "13_coupon_limit")
+    player_id = job["player_id"]
+    text = pm.describe(limit.hwnd)
+    log(f"  [{step}] PM: daily redemption limit reached ({text}); answering No - the coupon is not issued")
+    no = pm.child(limit.hwnd, ID_NO)
+    if (not no or caption(pm, no).casefold() != "no") and hasattr(pm, "find_button"):
+        no = pm.find_button(limit.hwnd, "No")
+    if not no or caption(pm, no).casefold() != "no":
+        raise StepError(step, f"the No button of the daily-limit question was not found: {text}", limit.hwnd)
+
+    def answer_no(attempt):
+        log(f"  [{step}] click No")
+        pm.click(no)
+
+    attempt_until(pm, step, "answer No (no override)", answer_no, lambda: not pm.visible(limit.hwnd), T_POPUP_CLOSE,
+                  same_screen=lambda state: any(p.hwnd == limit.hwnd for p in state.popups), target=no)
+    time.sleep(1.0)                      # PM may close the redemption dialogs itself
+    for _ in range(2):                   # then the confirmation (if any) and Coupon Redemption: Cancel
+        state = read_state(pm)
+        raise_on_unknown(pm, step, state, "closing the refused redemption")
+        left = state.get(COUPON_CONFIRM) or state.get(COUPON)
+        if left is None:
+            break
+        close_popup(pm, step, left, ID_CANCEL, f"{left.kind} Cancel", expect="Cancel")
+    wait_state(pm, step, popups=(), main_enabled=True, player_id=player_id, timeout=T_POPUP_CLOSE, quiet=1.0,
+               what="PM idle, coupon not issued")
+    ledger_append(job, LEDGER_NOT_ISSUED)
+    progress["ok_clicked"] = False
+    progress["confirmation_check"] = "daily redemption limit reached - coupon NOT issued (answered No)"
+    COUPON_LIMIT["at"] = f"#{progress.get('index', '?')} player {player_id} ({job['sheet']} row {job['excel_row']})"
+
+    jobs = RUN_FILES.get("jobs") or [job]
+    index = progress.get("index", 1)
+    remaining = [j for j in jobs[index - 1:] if WORKFLOWS[j["workflow"]]["kind"] == "coupon"]
+    lines = []
+    for workflow in ("MONTHLY_SLOT", "REBATE_SLOT", "COSMO_SLOT"):
+        part = [j for j in remaining if j["workflow"] == workflow]
+        if part:
+            reason, expires, comment = slots_adjust_settings(part[0], progress["today"])
+            lines.append(f"- {WORKFLOWS[workflow]['label']}: {len(part)} row(s), Reason {reason}, "
+                         f"expires {expires:%m/%d/%Y %I:%M %p}, comment '{comment}'")
+    message = (f"PM: the daily coupon redemption limit of this account is reached "
+               f"(player {player_id}, {job['sheet']} row {job['excel_row']}, amount {job['amount']}).\n"
+               f"The runner answered No and closed the coupon: this coupon was NOT issued.\n\n"
+               f"Issue this row and the remaining Slot rows ({len(remaining)} in total) with "
+               f"Rewards > SLOTS > Adjust instead of a coupon?\n" + "\n".join(lines) +
+               "\n\nYes = SLOTS Adjust.   No = leave the Slot rows NOT DONE (the BBR rows go on).")
+    if ask_user_yes_no(pm, "PM Rewards runner - daily coupon limit", message, step):
+        COUPON_LIMIT["mode"] = "adjust"
+        note_problem(f"daily coupon limit reached at {COUPON_LIMIT['at']}: Slot rows from there on issued with "
+                     f"SLOTS Adjust")
+        run_slots_adjust(pm, job, progress, allow_ok=True)
+        return
+    COUPON_LIMIT["mode"] = "skip"
+    note_problem(f"daily coupon limit reached at {COUPON_LIMIT['at']}: SLOTS Adjust declined, Slot rows from there "
+                 f"on NOT DONE")
+    raise PlayerSkipped("NOT_DONE_LIMIT", "daily coupon redemption limit reached - coupon not issued; "
+                                          "SLOTS Adjust declined. Issue it by hand.")
 
 
 def run_coupon(pm, job, progress, allow_ok):
@@ -2414,42 +2520,80 @@ def run_coupon(pm, job, progress, allow_ok):
         finish_dialog(pm, step, job, progress, coupon, allow_ok)
 
 
-def run_bbr(pm, job, progress, allow_ok):
-    """Workflows #2 and #4: Rewards BBR > Adjust > Add BBR, amount, expiration, reason, comment."""
-    player_id, amount = job["player_id"], job["amount"]
-    wf = WORKFLOWS[job["workflow"]]
-    expires = expiration_for(job["workflow"], progress["today"])
-    comment = wf["comment"](progress["today"])
+ADJUST_BUCKETS = {
+    "BBR": {"radio": BBR_RADIO, "header": "BBR Adjustment", "add": "Add BBR", "subtract": "Subtract BBR",
+            "zero": "Set BBR to 0"},
+    "SLOTS": {"radio": SLOTS_RADIO, "header": "SLOTS Adjustment", "add": "Add SLOTS", "subtract": "Subtract SLOTS",
+              "zero": "Set SLOTS to 0"},
+}
 
-    step = begin_step(progress, "7_select_bbr")
+
+def run_bbr(pm, job, progress, allow_ok):
+    """Workflows #2, #4, #6: Rewards BBR > Adjust > Add BBR, amount, expiration, reason, comment."""
+    wf = WORKFLOWS[job["workflow"]]
+    comment = job.get("comment") or wf["comment"](progress["today"])
+    run_adjust(pm, job, progress, allow_ok, "BBR", wf["reason"], expiration_for(job["workflow"], progress["today"]),
+               comment)
+
+
+def slots_adjust_settings(job, today):
+    """Reason, expiration and comment of a Slot row issued with SLOTS Adjust: those of the BBR rows of
+    the same sheet (Monthly: G) MBS FP, +14 days; Rebate: P) Your 5% (Rebate), +30; COSMO: +3)."""
+    source = SLOTS_ADJUST_SOURCE[job["workflow"]]
+    wf = WORKFLOWS[source]
+    comment = wf["comment"](today)
+    if job["workflow"] == "MONTHLY_SLOT" and RUN_SETTINGS.get("monthly_comment"):
+        comment = RUN_SETTINGS["monthly_comment"]
+    return wf["reason"], expiration_for(source, today), comment
+
+
+def run_slots_adjust(pm, job, progress, allow_ok):
+    """A Slot row issued with Rewards > SLOTS > Adjust > Add SLOTS instead of a coupon."""
+    reason, expires, comment = slots_adjust_settings(job, progress["today"])
+    progress["issued_by"] = "SLOTS Adjust"
+    log(f"  Slot row issued with SLOTS Adjust instead of a coupon: {job['amount']}, {reason}, "
+        f"expires {expires:%m/%d/%Y %I:%M %p}, '{comment}'")
+    run_adjust(pm, job, progress, allow_ok, "SLOTS", reason, expires, comment)
+
+
+def run_adjust(pm, job, progress, allow_ok, bucket, reason, expires, comment):
+    """Rewards <bucket> > Adjust > Add <bucket>, amount, expiration, reason, comment, then OK / Cancel."""
+    player_id, amount = job["player_id"], job["amount"]
+    names = ADJUST_BUCKETS[bucket]
+    low = bucket.lower()
+
+    step = begin_step(progress, f"7_select_{low}")
     check_state(pm, step, popups=(), main_enabled=True, player_id=player_id)
     tab = active_profile_tab(pm, step, player_id)
-    frame, bbr, adjust = (pm.child(tab, REWARDS_FRAME_ID), pm.child(tab, BBR_RADIO), pm.child(tab, ADJUST_BUTTON))
-    if not frame or not bbr or not adjust:
-        raise StepError(step, "Rewards frame, BBR or Adjust not found on the profile tab.")
-    if pm.text(frame).strip() != "Rewards" or pm.text(bbr).replace("&", "").strip() != "BBR" \
+    frame, radio, adjust = (pm.child(tab, REWARDS_FRAME_ID), pm.child(tab, names["radio"]),
+                            pm.child(tab, ADJUST_BUTTON))
+    if not frame or not radio or not adjust:
+        raise StepError(step, f"Rewards frame, {bucket} or Adjust not found on the profile tab.")
+    if pm.text(frame).strip() != "Rewards" or pm.text(radio).replace("&", "").strip() != bucket \
             or pm.text(adjust).replace("&", "").strip() != "Adjust":
-        raise StepError(step, f"unexpected controls: frame '{pm.text(frame)}', radio '{pm.text(bbr)}', "
+        raise StepError(step, f"unexpected controls: frame '{pm.text(frame)}', radio '{pm.text(radio)}', "
                               f"button '{pm.text(adjust)}'.")
-    if not inside(pm.rect(frame), pm.rect(bbr)) or not inside(pm.rect(frame), pm.rect(adjust)):
-        raise StepError(step, "BBR / Adjust are not inside the Rewards frame.")
-    def select_bbr(attempt):
-        if not pm.checked(bbr):
-            log(f"  [{step}] click BBR (id={BBR_RADIO})")
-            pm.click(bbr)
+    if not inside(pm.rect(frame), pm.rect(radio)) or not inside(pm.rect(frame), pm.rect(adjust)):
+        raise StepError(step, f"{bucket} / Adjust are not inside the Rewards frame.")
 
-    attempt_until(pm, step, "select BBR", select_bbr, lambda: pm.checked(bbr) and pm.enabled(adjust), T_VERIFY,
-                  same_screen=screen_is((), main_enabled=True),
-                  describe=lambda: f"BBR selected={pm.checked(bbr)}, Adjust enabled={pm.enabled(adjust)}",
-                  target=bbr)
+    def select_radio(attempt):
+        if not pm.checked(radio):
+            log(f"  [{step}] click {bucket} (id={names['radio']})")
+            pm.click(radio)
+
+    attempt_until(pm, step, f"select {bucket}", select_radio, lambda: pm.checked(radio) and pm.enabled(adjust),
+                  T_VERIFY, same_screen=screen_is((), main_enabled=True),
+                  describe=lambda: f"{bucket} selected={pm.checked(radio)}, Adjust enabled={pm.enabled(adjust)}",
+                  target=radio)
     wait_state(pm, step, popups=(), main_enabled=True, player_id=player_id, quiet=0.5,
-               what="PM idle with BBR selected")
-    log(f"  [{step}] checkpoint: BBR selected")
+               what=f"PM idle with {bucket} selected")
+    log(f"  [{step}] checkpoint: {bucket} selected")
 
     step = begin_step(progress, "8_open_adjustment")
     check_state(pm, step, popups=(), main_enabled=True, player_id=player_id)
-    if not pm.checked(bbr):
-        raise StepError(step, "BBR is no longer selected.")
+    if not pm.checked(radio):
+        raise StepError(step, f"{bucket} is no longer selected.")
+
     def press_adjust(attempt):
         log(f"  [{step}] click Adjust (id={ADJUST_BUTTON})")
         pm.click(adjust)
@@ -2457,26 +2601,27 @@ def run_bbr(pm, job, progress, allow_ok):
     dialog = attempt_until(pm, step, "open Player Adjustment", press_adjust,
                            lambda: state_if(pm, popups=(ADJUST,), main_enabled=False, player_id=player_id),
                            T_ADJUST_OPEN,
-                           same_screen=lambda state: screen_is((), main_enabled=True)(state) and pm.checked(bbr),
+                           same_screen=lambda state: screen_is((), main_enabled=True)(state) and pm.checked(radio),
                            target=adjust).get(ADJUST)
     header = control(pm, step, dialog, ADJ_HEADER, "adjustment header", need_enabled=False)
-    if pm.text(header).strip() != "BBR Adjustment":
-        raise StepError(step, f"Player Adjustment is '{pm.text(header)}', expected 'BBR Adjustment'.")
-    log(f"  [{step}] checkpoint: 'BBR Adjustment' is open")
+    if pm.text(header).strip() != names["header"]:
+        raise StepError(step, f"Player Adjustment is '{pm.text(header)}', expected '{names['header']}'.")
+    log(f"  [{step}] checkpoint: '{names['header']}' is open")
 
-    step = begin_step(progress, "9_add_bbr")
+    step = begin_step(progress, f"9_add_{low}")
     check_state(pm, step, popups=(ADJUST,), main_enabled=False, player_id=player_id)
-    add = control(pm, step, dialog, ADJ_ADD_RADIO, "Add BBR", expect="Add BBR")
+    add = control(pm, step, dialog, ADJ_ADD_RADIO, names["add"], expect=names["add"])
     others = [control(pm, step, dialog, cid, name, need_enabled=False)
-              for cid, name in ((ADJ_SUBTRACT_RADIO, "Subtract BBR"), (ADJ_ZERO_RADIO, "Set BBR to 0"))]
+              for cid, name in ((ADJ_SUBTRACT_RADIO, names["subtract"]), (ADJ_ZERO_RADIO, names["zero"]))]
+
     def select_add(attempt):
         if not pm.checked(add) or any(pm.checked(h) for h in others):
-            click(pm, step, dialog, ADJ_ADD_RADIO, "Add BBR", expect="Add BBR")
+            click(pm, step, dialog, ADJ_ADD_RADIO, names["add"], expect=names["add"])
 
-    attempt_until(pm, step, "select Add BBR", select_add,
+    attempt_until(pm, step, f"select {names['add']}", select_add,
                   lambda: pm.checked(add) and not any(pm.checked(h) for h in others), T_VERIFY,
                   same_screen=screen_is((ADJUST,), main_enabled=False), target=add)
-    log(f"  [{step}] checkpoint: Add BBR selected")
+    log(f"  [{step}] checkpoint: {names['add']} selected")
 
     step = begin_step(progress, "10_enter_adjustment")
     check_state(pm, step, popups=(ADJUST,), main_enabled=False, player_id=player_id)
@@ -2505,6 +2650,7 @@ def run_bbr(pm, job, progress, allow_ok):
     step = begin_step(progress, "11_set_expiration")
     check_state(pm, step, popups=(ADJUST,), main_enabled=False, player_id=player_id)
     picker = control(pm, step, dialog, ADJ_EXPIRATION, "Expiration")
+
     def set_date(attempt):
         log(f"  [{step}] set Expiration to {expires:%m/%d/%Y %I:%M %p}")
         pm.date_set(picker, expires)
@@ -2519,10 +2665,10 @@ def run_bbr(pm, job, progress, allow_ok):
     step = begin_step(progress, "12_select_reason")
     check_state(pm, step, popups=(ADJUST,), main_enabled=False, player_id=player_id)
     reason_combo = control(pm, step, dialog, ADJ_REASON_COMBO, "Reason")
-    select_combo(pm, step, reason_combo, wf["reason"], "Reason", screen=(ADJUST,))
+    select_combo(pm, step, reason_combo, reason, "Reason", screen=(ADJUST,))
     wait_state(pm, step, popups=(ADJUST,), main_enabled=False, player_id=player_id,
                what="Player Adjustment only")
-    log(f"  [{step}] checkpoint: Reason = {wf['reason']}")
+    log(f"  [{step}] checkpoint: Reason = {reason}")
 
     step = begin_step(progress, "13_enter_comment")
     check_state(pm, step, popups=(ADJUST,), main_enabled=False, player_id=player_id)
@@ -2534,17 +2680,17 @@ def run_bbr(pm, job, progress, allow_ok):
     step = begin_step(progress, "14_ok_adjustment" if allow_ok else "14_cancel_adjustment")
     check_state(pm, step, popups=(ADJUST,), main_enabled=False, player_id=player_id)
     problems = []
-    if pm.text(header).strip() != "BBR Adjustment":
+    if pm.text(header).strip() != names["header"]:
         problems.append("header")
     if not pm.checked(add) or any(pm.checked(h) for h in others):
-        problems.append("Add BBR")
+        problems.append(names["add"])
     if normalized_number_text(pm.text(amount_field)) != normalized_number_text(amount):
         problems.append("Adjustment")
     if money(pm.text(new_label)) is None or abs(money(pm.text(new_label)) - expected_new) >= 0.005:
         problems.append("New Balance")
     if pm.date_get(picker) != expires:
         problems.append("Expiration")
-    if pm.combo_selected(reason_combo) != wf["reason"]:
+    if pm.combo_selected(reason_combo) != reason:
         problems.append("Reason")
     if pm.text(comment_field).strip() != comment:
         problems.append("Comment")
@@ -2552,15 +2698,18 @@ def run_bbr(pm, job, progress, allow_ok):
         problems.append("profile tab")
     if problems:
         raise StepError(step, f"changed before the final click: {', '.join(problems)}. Nothing was clicked.")
-    log(f"  [{step}] final check OK: player {player_id}, Add BBR {amount}, expires "
-        f"{expires:%m/%d/%Y %I:%M %p}, {wf['reason']}, '{comment}'")
+    log(f"  [{step}] final check OK: player {player_id}, {names['add']} {amount}, expires "
+        f"{expires:%m/%d/%Y %I:%M %p}, {reason}, '{comment}'")
     finish_dialog(pm, step, job, progress, dialog, allow_ok)
 
 
 def process_job(pm, job, progress, allow_ok=False):
     open_profile(pm, job, progress)
     if WORKFLOWS[job["workflow"]]["kind"] == "coupon":
-        run_coupon(pm, job, progress, allow_ok)
+        if FORCE_SLOTS_ADJUST or COUPON_LIMIT["mode"] == "adjust":
+            run_slots_adjust(pm, job, progress, allow_ok)
+        else:
+            run_coupon(pm, job, progress, allow_ok)
     else:
         run_bbr(pm, job, progress, allow_ok)
 
@@ -2619,9 +2768,13 @@ def ledger_done_today():
     if not LEDGER_FILE.exists():
         return set()
     today = datetime.now().date().isoformat()
+    latest = {}
     with LEDGER_FILE.open(newline="", encoding="utf-8-sig") as file:
-        return {(row["player_id"], row.get("workflow", "")) for row in csv.DictReader(file)
-                if row.get("date") == today}
+        for row in csv.DictReader(file):
+            if row.get("date") == today:
+                latest[(row["player_id"], row.get("workflow", ""))] = row.get("status", "")
+    # a coupon refused by the daily limit (answered No) was not issued: it is not done
+    return {key for key, status in latest.items() if status != LEDGER_NOT_ISSUED}
 
 
 def ledger_append(job, status):
@@ -2637,23 +2790,62 @@ def ledger_append(job, status):
                          "status": status, "sheet": job["sheet"], "excel_row": job["excel_row"]})
 
 
+def ask_user_yes_no(pm, title, message, step):
+    """Yes/No message box on top of whatever the user is doing (they may be working in another app).
+
+    The runner waits for the answer; meanwhile it keeps reading PM so that an 'Application
+    Timeout' logoff countdown is still closed. No is the default button (Enter = No).
+    """
+    log(f"  [{step}] QUESTION shown in a popup: {title} - " + " / ".join(message.splitlines()))
+    answer = {}
+
+    def show():
+        try:
+            # MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2 | MB_SETFOREGROUND | MB_TOPMOST
+            answer["id"] = ctypes.windll.user32.MessageBoxW(None, message, title, 0x4 | 0x30 | 0x100 | 0x10000 | 0x40000)
+        except AttributeError:           # not on Windows: ask in the terminal
+            answer["id"] = ID_YES if input(f"{title}\n{message}\nYes / No: ").strip().casefold() in ("y", "yes") \
+                else ID_NO
+        except Exception as exc:
+            answer["error"] = exc
+
+    worker = threading.Thread(target=show, daemon=True)
+    worker.start()
+    while worker.is_alive():
+        worker.join(0.5)
+        try:
+            read_state(pm)               # closes an Application Timeout while the question is open
+        except Exception as exc:
+            log(f"  [{step}] while waiting for the answer: {exc}")
+    if "error" in answer:
+        log(f"  [{step}] the question could not be shown ({answer['error']}); taken as NO")
+    yes = answer.get("id") == ID_YES
+    log(f"  [{step}] answer: {'YES' if yes else 'NO'}")
+    return yes
+
+
 def ask_monthly_comment(jobs, today):
-    """Show the Monthly Benefit BBR comment; Enter keeps it, or type another one for all those rows."""
+    """Show the Monthly Benefit comment; Enter keeps it, or type another one for all those rows.
+
+    It is used by the BBR rows and by the Slot rows if they have to be issued with SLOTS Adjust.
+    """
     monthly = [j for j in jobs if j["workflow"] == "MONTHLY_BBR"]
-    if not monthly:
+    if not any(j["workflow"] in ("MONTHLY_BBR", "MONTHLY_SLOT") for j in jobs):
         return True
     suggested, standard = monthly_comment(today)
     print("\n" + "=" * 78)
     if not standard:
         print(f"WARNING: today ({today:%m/%d/%Y}) is not the 1st or the 15th of the month.")
         print(f"The Monthly Benefit comment would normally be for the 1st or the 15th; suggested: '{suggested}'.")
-    print(f"Comment for the {len(monthly)} Monthly Benefit BBR row(s): '{suggested}'")
+    print(f"Comment for the {len(monthly)} Monthly Benefit BBR row(s) (and the Slot rows if they are issued "
+          f"with SLOTS Adjust): '{suggested}'")
     answer = input("Press Enter to use it for all of them, or type another comment: ").strip()
     comment = answer or suggested
     if not comment:
         return False
     for job in monthly:
         job["comment"] = comment
+    RUN_SETTINGS["monthly_comment"] = comment
     log(f"Monthly Benefit BBR comment: '{comment}'" + (" (typed by the user)" if answer else "")
         + ("" if standard else f" - today is not the 1st or the 15th, suggested was '{suggested}'"))
     return True
@@ -2681,7 +2873,8 @@ def ask_allow_ok(jobs):
 CSV_FIELDS = [
     "timestamp", "order", "workflow", "sheet", "excel_row", "player_id", "amount", "target", "expiration",
     "comment", "test_mode", "status", "failed_step", "message", "identification", "name_color", "stop_codes",
-    "system_messages", "comment_pages", "confirmation", "confirmation_check", "duration_s", "screenshots",
+    "system_messages", "comment_pages", "confirmation", "confirmation_check", "issued_by", "duration_s",
+    "screenshots",
 ]
 
 
@@ -2700,6 +2893,8 @@ def run(pm, jobs, username, password, allow_ok=False, today=None):
     done_today = ledger_done_today() if allow_ok else set()
     results = []
     RUN_FILES["results"] = results   # for the STATUS sheet
+    RUN_FILES["jobs"] = jobs
+    COUPON_LIMIT.update(mode=None, at=None)
     RUN_FILES["loc"] = []            # SKIPPED_LOC rows, to be done by hand
     RUN_FILES.pop("stopped_at", None)
     tabs = []
@@ -2713,7 +2908,7 @@ def run(pm, jobs, username, password, allow_ok=False, today=None):
 
     for index, job in enumerate(jobs, start=1):
         started = time.time()
-        progress = {"step": "1_precheck_idle", "today": today}
+        progress = {"step": "1_precheck_idle", "today": today, "index": index}
         wf = WORKFLOWS[job["workflow"]]
         record = {
             "timestamp": datetime.now().isoformat(timespec="seconds"), "order": index,
@@ -2722,7 +2917,7 @@ def run(pm, jobs, username, password, allow_ok=False, today=None):
             "expiration": job["expiration"], "comment": job["comment"], "test_mode": not allow_ok,
             "status": "", "failed_step": "", "message": "", "identification": "", "name_color": "",
             "stop_codes": "", "system_messages": "", "comment_pages": "", "confirmation": "",
-            "confirmation_check": "", "duration_s": "", "screenshots": "",
+            "confirmation_check": "", "issued_by": "", "duration_s": "", "screenshots": "",
         }
         log(f"[{index}/{len(jobs)}] #{wf['no']} {wf['label']}: player {job['player_id']}, amount {job['amount']} "
             f"({job['sheet']} row {job['excel_row']})")
@@ -2733,10 +2928,20 @@ def run(pm, jobs, username, password, allow_ok=False, today=None):
             write_log(results)
             log("  skipped: already done today")
             continue
+        if COUPON_LIMIT["mode"] == "skip" and wf["kind"] == "coupon" and not FORCE_SLOTS_ADJUST:
+            record.update({"status": "NOT_DONE_LIMIT", "duration_s": 0,
+                           "message": "daily coupon redemption limit reached earlier in this run; SLOTS Adjust "
+                                      "was declined. Issue it by hand."})
+            results.append(record)
+            write_log(results)
+            log("  not done: daily coupon limit reached, SLOTS Adjust declined")
+            continue
         try:
             process_job(pm, job, progress, allow_ok)
             record["status"] = "DONE" if allow_ok else "TEST_CANCELLED"
             record["message"] = ("Confirmed with OK." if allow_ok else "All fields filled and checked; cancelled.")
+            if progress.get("issued_by"):
+                record["message"] += f" Issued with {progress['issued_by']} instead of a coupon."
         except PlayerSkipped as skip:
             record["status"] = skip.status
             record["message"] = str(skip)
@@ -2757,7 +2962,7 @@ def run(pm, jobs, username, password, allow_ok=False, today=None):
                                                      everything=True)),
             })
         for key in ("identification", "name_color", "stop_codes", "system_messages", "comment_pages",
-                    "confirmation", "confirmation_check"):
+                    "confirmation", "confirmation_check", "issued_by"):
             record[key] = progress.get(key, "")
         record["duration_s"] = round(time.time() - started, 1)
         results.append(record)
