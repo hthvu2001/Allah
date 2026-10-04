@@ -99,7 +99,7 @@ try:
 except ImportError:  # lets the step logic be imported and tested off Windows
     win32con = win32gui = win32process = None
 
-RUNNER_VERSION = "4.11-six-workflows"
+RUNNER_VERSION = "4.12-six-workflows"
 BASE_DIR = Path(__file__).resolve().parent
 EXCEL_FILE = BASE_DIR / "Excel-for-auto.xlsx"
 LOG_FILE = BASE_DIR / "pm_automation_log.csv"
@@ -293,6 +293,44 @@ class StepError(RuntimeError):
         self.hwnd = hwnd          # control the step was working on (framed in the screenshot)
 
 
+class RunStopped(Exception):
+    """The terminal window is being closed (or Windows signs out / shuts down): stop at the next check."""
+
+
+STOP = {"reason": None}
+_main_done = threading.Event()
+
+
+def check_stop():
+    if STOP["reason"]:
+        raise RunStopped(STOP["reason"])
+
+
+def install_close_handler():
+    """Windows gives a console program about 5 s when its window is closed: use them to stop at the
+    next safe point and write the Excel check file as at a normal end (STATUS, Loc players...)."""
+    try:
+        import win32api
+    except ImportError:
+        return
+
+    reasons = {2: "the terminal window was closed", 5: "Windows is signing out", 6: "Windows is shutting down"}
+
+    def handler(ctrl_type):
+        if ctrl_type not in reasons:     # Ctrl+C / Ctrl+Break: Python's own handling (KeyboardInterrupt)
+            return False
+        STOP["reason"] = reasons[ctrl_type]
+        if not _main_done.wait(4.0):     # the runner could not finish in time: save what is known now
+            save_check_file(outcome=f"STOPPED: {STOP['reason']} (the runner was closed before it finished)",
+                            final=True)
+        return True
+
+    try:
+        win32api.SetConsoleCtrlHandler(handler, True)
+    except Exception as exc:
+        log(f"(could not watch the terminal window: {exc})")
+
+
 class PlayerSkipped(Exception):
     """The player must not be processed; logged and the run continues."""
 
@@ -438,6 +476,11 @@ def loc_line(row):
 def add_loc_sheet(path, rows, stopped_at=None):
     """Sheet LOC_SHEET in the Excel check file: players skipped for '(Loc:', to be done by hand."""
     wb = load_workbook(path)
+    fill_loc_sheet(wb, rows, stopped_at)
+    wb.save(path)
+
+
+def fill_loc_sheet(wb, rows, stopped_at=None):
     if LOC_SHEET in wb.sheetnames:
         del wb[LOC_SHEET]
     sheet = wb.create_sheet(LOC_SHEET, 0 if rows else len(wb.sheetnames))
@@ -456,7 +499,6 @@ def add_loc_sheet(path, rows, stopped_at=None):
         sheet.append([f"The run stopped at #{stopped_at}: players after it were not checked for '(Loc:'."])
     if rows:
         wb.active = 0
-    wb.save(path)
 
 
 def finish_run_files(kind):
@@ -473,25 +515,24 @@ def finish_run_files(kind):
     check = RUN_FILES.get("check")
     bar = "=" * 78
     target = day_dir / kind if kind else day_dir
-    if loc_rows is not None and check and Path(check).exists():
-        try:
-            add_loc_sheet(check, loc_rows, RUN_FILES.get("stopped_at"))
-        except Exception as exc:
-            log(f"Could not add the sheet '{LOC_SHEET}' to {Path(check).name}: {exc}")
-    if "plan" in RUN_FILES and check and Path(check).exists():
-        try:
-            jobs, notes, violations = RUN_FILES["plan"]
-            add_status_sheet(check, RUN_FILES.get("sources", {}),
-                             (jobs, notes, violations, RUN_FILES.get("results", [])))
-        except Exception as exc:
-            log(f"Could not add the sheet '{STATUS_SHEET}' to {Path(check).name}: {exc}")
+    if check and "plan" in RUN_FILES:
+        outcome = {None: "NO ERROR", ERROR_FOLDER: "ERROR - see the error folder",
+                   VIOLATION_FOLDER: "VIOLATION in the Excel file - nothing was done in PM"}[kind]
+        if STOP["reason"]:
+            outcome = f"STOPPED: {STOP['reason']}"
+        if not save_check_file(outcome=outcome, final=True):
+            time.sleep(0.5)
+            save_check_file(outcome=outcome, final=True)
     log(bar)
     if kind is None:
         log(f"NO ERROR. Logs: {target}")
         for line in problems:
             log(f"  note: {line}")
     else:
-        log(f"{'ERROR' if kind == ERROR_FOLDER else 'VIOLATION in the Excel file'} - please check: {target}")
+        title = 'ERROR' if kind == ERROR_FOLDER else 'VIOLATION in the Excel file'
+        if STOP["reason"]:
+            title = f"STOPPED: {STOP['reason']}"
+        log(f"{title} - please check: {target}")
         for line in problems or ["see the log file in that folder"]:
             log(f"  {line}")
     if _app_timeout["count"]:
@@ -781,9 +822,11 @@ STATUS_SHEET = "STATUS"
 STATUS_FILLS = {"DONE": "C6EFCE", "NOT DONE": "FFC7CE", "CHECK IN PM": "FFEB9C", "NOTHING TO DO": "EDEDED"}
 
 
-def row_status(sheet, excel_row, plan):
-    """(status, note) of one Excel row, from the plan and the results of this run."""
+def row_status(sheet, excel_row, plan, ledger=None):
+    """(status, note) of one Excel row, from the plan, the results of this run and today's ledger."""
     jobs, notes, violations, results = plan
+    ledger = ledger or {}
+    current = RUN_FILES.get("current")
     for v in violations:
         if v["sheet"] == sheet and str(excel_row) in [x.strip() for x in str(v["rows"]).split(",")]:
             return "NOT DONE", f"Excel violation: {v['rule']} - {v['detail']}. The run stopped before PM."
@@ -825,6 +868,22 @@ def row_status(sheet, excel_row, plan):
         elif status.startswith("ERROR"):
             statuses.append("NOT DONE")
             parts.append(f"{what}: error at {record['failed_step']}: {record['message'].split(' | screen:')[0][:200]}")
+        elif current is not None and current[0] is job and not RUN_FILES.get("final"):
+            statuses.append("NOT DONE")
+            clicked = ledger.get((job["player_id"], job["workflow"])) in ("OK_CLICKED", "CONFIRM_CLICKED")
+            parts.append(f"{what}: being processed now (step {current[1].get('step')}"
+                         + (", OK clicked" if clicked else "") + ")")
+        elif ledger.get((job["player_id"], job["workflow"])) in ("OK_CLICKED", "CONFIRM_CLICKED"):
+            statuses.append("CHECK IN PM")
+            parts.append(f"{what}: OK was clicked but the run stopped before the result was written - "
+                         f"check in PM whether it was issued")
+        elif ledger.get((job["player_id"], job["workflow"])) == "DONE":
+            statuses.append("DONE")
+            parts.append(f"{what}: done (pm_redeemed_ledger.csv)")
+        elif current is not None and current[0] is job:
+            statuses.append("NOT DONE")
+            parts.append(f"{what}: the run stopped while this row was at step {current[1].get('step')} "
+                         f"(before any OK) - not done")
         else:
             statuses.append("NOT DONE")
             stopped = RUN_FILES.get("stopped_at")
@@ -836,16 +895,26 @@ def row_status(sheet, excel_row, plan):
     return "NOT DONE", " | ".join(parts)
 
 
-def add_status_sheet(path, tables, plan):
+def add_status_sheet(path, tables, plan, run_line="", ledger=None):
     """Sheet STATUS: REBATE / DAILY REWARDS / MONTHLY BNF side by side (2 empty columns between them),
     every Excel row with all its columns plus Status (DONE / NOT DONE / CHECK IN PM / NOTHING TO DO) and Note."""
+    wb = load_workbook(path)
+    fill_status_sheet(wb, tables, plan, run_line, ledger)
+    wb.save(path)
+
+
+STATUS_FIRST_ROW = 3            # row 1: the state of the run, row 2: empty, row 3: table titles
+
+
+def fill_status_sheet(wb, tables, plan, run_line="", ledger=None):
     from openpyxl.styles import Font, PatternFill
     from openpyxl.utils import get_column_letter
-    wb = load_workbook(path)
     if STATUS_SHEET in wb.sheetnames:
         del wb[STATUS_SHEET]
     sheet = wb.create_sheet(STATUS_SHEET, 0)
     bold = Font(bold=True)
+    sheet.cell(row=1, column=1, value=run_line).font = Font(bold=True, size=12)
+    top = STATUS_FIRST_ROW
     column = 1
     for name in SOURCE_SHEETS:
         headers, data = tables.get(name, ([], []))
@@ -853,15 +922,15 @@ def add_status_sheet(path, tables, plan):
         counts = {}
         rows = []
         for excel_row, values in data:
-            status, note = row_status(name, excel_row, plan)
+            status, note = row_status(name, excel_row, plan, ledger)
             counts[status] = counts.get(status, 0) + 1
             rows.append([excel_row] + list(values) + [status, note])
         title = f"{name}: " + ((", ".join(f"{n} {s}" for s, n in counts.items()) or "no rows")
                                if name in tables else "sheet not found")
-        sheet.cell(row=1, column=column, value=title).font = bold
+        sheet.cell(row=top, column=column, value=title).font = bold
         for offset, header in enumerate(headers):
-            sheet.cell(row=2, column=column + offset, value=header).font = bold
-        for r, values in enumerate(rows, start=3):
+            sheet.cell(row=top + 1, column=column + offset, value=header).font = bold
+        for r, values in enumerate(rows, start=top + 2):
             for offset, value in enumerate(values):
                 sheet.cell(row=r, column=column + offset, value=value)
             fill = STATUS_FILLS.get(values[-2])
@@ -872,17 +941,23 @@ def add_status_sheet(path, tables, plan):
             width = 60 if header == "Note" else max(10, min(24, len(header) + 2))
             sheet.column_dimensions[get_column_letter(column + offset)].width = width
         column += len(headers) + 2          # two empty columns between the tables
-    sheet.freeze_panes = "A3"
+    sheet.freeze_panes = f"A{top + 2}"
     wb.active = 0
-    wb.save(path)
 
 
 def write_check_file(jobs, notes, violations):
     if RUN_FILES.get("dir"):
         path = RUN_FILES["dir"] / f"pm_excel_check_{RUN_FILES['stamp']}.xlsx"
         RUN_FILES["check"] = path
-    else:
-        path = BASE_DIR / f"pm_excel_check_{datetime.now():%Y%m%d_%H%M%S}.xlsx"
+        RUN_FILES["plan"] = (jobs, notes, violations)
+        save_check_file()
+        return path
+    path = BASE_DIR / f"pm_excel_check_{datetime.now():%Y%m%d_%H%M%S}.xlsx"
+    build_check_workbook(jobs, notes, violations).save(path)
+    return path
+
+
+def build_check_workbook(jobs, notes, violations):
     wb = Workbook()
     plan = wb.active
     plan.title = "PLAN"
@@ -903,8 +978,98 @@ def write_check_file(jobs, notes, violations):
     if violations:
         wb.move_sheet("VIOLATIONS", offset=-2)
         wb.active = 0
-    wb.save(path)
-    return path
+    return wb
+
+
+_check_lock = threading.Lock()
+_check_wake = threading.Event()
+_check_thread = {"thread": None, "warned": False}
+
+
+def ledger_latest_today():
+    """(player, workflow) -> latest ledger status today."""
+    latest = {}
+    try:
+        today = datetime.now().date().isoformat()
+        with LEDGER_FILE.open(newline="", encoding="utf-8-sig") as file:
+            for row in csv.DictReader(file):
+                if row.get("date") == today:
+                    latest[(row["player_id"], row.get("workflow", ""))] = row.get("status", "")
+    except OSError:
+        pass
+    return latest
+
+
+def run_state_line(outcome=None):
+    jobs = RUN_FILES.get("plan", ([], [], []))[0]
+    results = RUN_FILES.get("results") or []
+    now = datetime.now().strftime("%H:%M:%S")
+    head = f"Run {RUN_FILES.get('stamp', '')} ({RUNNER_VERSION}) - "
+    if outcome:
+        return head + f"FINISHED {now}: {outcome}. {len(results)} of {len(jobs)} row(s) handled."
+    current = RUN_FILES.get("current")
+    where = ""
+    if current is not None:
+        job, progress = current
+        where = f"; now #{progress.get('index')} player {job['player_id']} at step {progress.get('step')}"
+    return head + (f"IN PROGRESS - last update {now}: {len(results)} of {len(jobs)} row(s) handled{where}. "
+                   "If the runner was closed, 'not processed' rows were not done and 'CHECK IN PM' rows "
+                   "had their OK clicked.")
+
+
+def save_check_file(outcome=None, final=False):
+    """(Re)write the whole Excel check file: STATUS, Loc players, PLAN, NOTES, VIOLATIONS.
+
+    Written to a temporary file first and then put in place, so a crash or a closed terminal never
+    leaves a half-written file. Returns False if the file could not be written (open in Excel...).
+    """
+    path = RUN_FILES.get("check")
+    if not path or "plan" not in RUN_FILES:
+        return True
+    with _check_lock:
+        if RUN_FILES.get("final") and not final:
+            return True                  # the end of the run has been written: keep it
+        if final:
+            RUN_FILES["final"] = True
+        try:
+            jobs, notes, violations = RUN_FILES["plan"]
+            wb = build_check_workbook(jobs, notes, violations)
+            if "loc" in RUN_FILES:
+                fill_loc_sheet(wb, RUN_FILES["loc"], RUN_FILES.get("stopped_at"))
+            if "sources" in RUN_FILES:
+                fill_status_sheet(wb, RUN_FILES["sources"], (jobs, notes, violations, RUN_FILES.get("results") or []),
+                                  run_state_line(outcome if final else None), ledger_latest_today())
+            path = Path(path)
+            temporary = path.with_name(path.stem + ".saving.xlsx")
+            wb.save(temporary)
+            os.replace(temporary, path)
+            return True
+        except Exception as exc:
+            try:
+                Path(path).with_name(Path(path).stem + ".saving.xlsx").unlink(missing_ok=True)
+            except OSError:
+                pass
+            if final or not _check_thread["warned"]:
+                _check_thread["warned"] = True
+                log(f"(could not update {Path(path).name}: {exc} - is it open in Excel?)")
+            return False
+
+
+def request_check_update():
+    """Ask the background writer to rewrite the Excel check file (does not slow the run down)."""
+    if not RUN_FILES.get("check") or RUN_FILES.get("final"):
+        return
+    if _check_thread["thread"] is None or not _check_thread["thread"].is_alive():
+        def writer():
+            while True:
+                _check_wake.wait()
+                _check_wake.clear()
+                if RUN_FILES.get("final"):
+                    return
+                save_check_file()
+        _check_thread["thread"] = threading.Thread(target=writer, daemon=True)
+        _check_thread["thread"].start()
+    _check_wake.set()
 
 
 # ------------------------------------------------------------ PM state
@@ -1598,6 +1763,7 @@ RUN_SETTINGS = {"monthly_comment": None}
 def read_state(pm):
     """PM's current state. An 'Application Timeout' logoff countdown is closed (Cancel) on the spot,
     whatever the runner is doing, so the step goes on as if it had not been there."""
+    check_stop()
     ensure_shown = getattr(pm, "ensure_shown", None)
     if ensure_shown:
         ensure_shown()
@@ -1698,6 +1864,8 @@ def wait_until(predicate, timeout, interval=POLL):
         try:
             if predicate():
                 return True
+        except RunStopped:
+            raise
         except Exception:
             pass
         if time.time() > deadline:
@@ -1729,7 +1897,7 @@ def save_screens(pm, step, reason, target=None, everything=False):
     and the main window. Pictures come from PM's own rendering (PrintWindow): no focus, no
     mouse, never the rest of the desktop, never the login window. Never stops the run.
     """
-    if not SCREENSHOTS or not hasattr(pm, "snapshot"):
+    if not SCREENSHOTS or not hasattr(pm, "snapshot") or STOP["reason"]:
         return []
     saved = []
     try:
@@ -1849,7 +2017,7 @@ def _safe_done(done, errors=None):
     """done() with read errors (e.g. a control being destroyed) counted as 'not yet'."""
     try:
         return done()
-    except StepError:
+    except (StepError, RunStopped):
         raise
     except Exception as exc:
         if errors is not None:
@@ -2192,7 +2360,9 @@ def inside(outer, inner, tolerance=4):
 
 def begin_step(progress, name):
     """Pause STEP_DELAY_SECONDS before every step, then record the step name."""
+    check_stop()
     time.sleep(STEP_DELAY_SECONDS)
+    check_stop()
     progress["step"] = name
     return name
 
@@ -2417,7 +2587,9 @@ def handle_coupon_limit(pm, step, job, progress, limit):
                f"Issue this row and the remaining Slot rows ({len(remaining)} in total) with "
                f"Rewards > SLOTS > Adjust instead of a coupon?\n" + "\n".join(lines) +
                "\n\nYes = SLOTS Adjust.   No = leave the Slot rows NOT DONE (the BBR rows go on).")
-    if ask_user_yes_no(pm, "PM Rewards runner - daily coupon limit", message, step):
+    answer = ask_user_yes_no(pm, "PM Rewards runner - daily coupon limit", message, step)
+    check_stop()                         # closing the terminal is not a "No"
+    if answer:
         COUPON_LIMIT["mode"] = "adjust"
         note_problem(f"daily coupon limit reached at {COUPON_LIMIT['at']}: Slot rows from there on issued with "
                      f"SLOTS Adjust")
@@ -2813,6 +2985,9 @@ def ask_user_yes_no(pm, title, message, step):
     worker.start()
     while worker.is_alive():
         worker.join(0.5)
+        if STOP["reason"]:
+            log(f"  [{step}] {STOP['reason']}: no answer, taken as NO")
+            return False
         try:
             read_state(pm)               # closes an Application Timeout while the question is open
         except Exception as exc:
@@ -2883,6 +3058,8 @@ def write_log(rows):
         writer = csv.DictWriter(file, fieldnames=CSV_FIELDS)
         writer.writeheader()
         writer.writerows(rows)
+    RUN_FILES.pop("current", None)
+    request_check_update()               # the Excel check file follows the CSV log
 
 
 def run(pm, jobs, username, password, allow_ok=False, today=None):
@@ -2909,6 +3086,8 @@ def run(pm, jobs, username, password, allow_ok=False, today=None):
     for index, job in enumerate(jobs, start=1):
         started = time.time()
         progress = {"step": "1_precheck_idle", "today": today, "index": index}
+        RUN_FILES["current"] = (job, progress)
+        request_check_update()
         wf = WORKFLOWS[job["workflow"]]
         record = {
             "timestamp": datetime.now().isoformat(timespec="seconds"), "order": index,
@@ -3026,8 +3205,14 @@ def main():
         raise SystemExit("Missing pm_credentials.py in the same folder.") from exc
 
     start_run_files()
+    STOP["reason"] = None
+    _main_done.clear()
+    install_close_handler()
     try:
         code = run_main(PM_USERNAME, PM_PASSWORD)
+    except RunStopped as exc:
+        log(f"STOPPED: {exc}. PM is left as it is.")
+        code = 1
     except KeyboardInterrupt:
         log("STOPPED with Ctrl+C. PM is left as it is.")
         note_problem("stopped with Ctrl+C")
@@ -3036,8 +3221,14 @@ def main():
         log(f"[FATAL] {type(exc).__name__}: {exc}")
         note_problem(f"{type(exc).__name__}: {exc}")
         code = 1
-    finish_run_files(VIOLATION_FOLDER if code == 2 else ERROR_FOLDER if code else None)
-    ask_open_check_file()
+    if STOP["reason"]:
+        note_problem(f"stopped: {STOP['reason']}")
+    try:
+        finish_run_files(VIOLATION_FOLDER if code == 2 else ERROR_FOLDER if code else None)
+    finally:
+        _main_done.set()
+    if not STOP["reason"]:
+        ask_open_check_file()
     return code
 
 
