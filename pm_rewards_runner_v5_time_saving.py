@@ -7,8 +7,9 @@ v5 changes only HOW LONG the runner waits, never WHAT it checks:
   - "PM must stay quiet for N s" waits shortened (profile popups 1.0 -> 0.6 s, after a field
     0.5 -> 0.2 s, after OK 1.0 -> 0.5 s);
   - PM is polled every 0.05 s instead of 0.1 s, a new try comes 0.5 s after a missed one;
-  - closing a profile tab: PM often ignores the first close after a coupon; v4 waited 5 s before
-    sending it again, v5 sends it again after 1.5 s, then 3 s, then 5 s (still 3 tries);
+  - closing a profile tab: PM ignores a close while the profile is still busy (loading, or
+    refreshing after an OK); the close is asked again every 1 s until the tab is gone (at most
+    60 s), instead of 3 tries in about 10 s (5.2: the run of 10/28 stopped there after a DONE);
   - the end of the run shows the run time and the average time per player.
 Pick the pace with SPEED = "safe" (default), "fast" or "v4" below.
 
@@ -112,7 +113,7 @@ try:
 except ImportError:  # lets the step logic be imported and tested off Windows
     win32con = win32gui = win32process = None
 
-RUNNER_VERSION = "5.1-time-saving"
+RUNNER_VERSION = "5.2-time-saving"
 BASE_DIR = Path(__file__).resolve().parent
 EXCEL_FILE = BASE_DIR / "Excel-for-auto.xlsx"
 LOG_FILE = BASE_DIR / "pm_automation_log.csv"
@@ -167,11 +168,11 @@ WORKFLOW_ORDER = ["REBATE_SLOT", "REBATE_BBR", "COSMO_SLOT", "COSMO_BBR", "MONTH
 SPEED = "safe"
 SPEED_PROFILES = {
     "v4": {"step": 1.0, "profile_quiet": 1.0, "short_quiet": 0.5, "ok_quiet": 1.0, "poll": 0.1,
-           "action": 0.1, "retry": 1.0, "tab_tries": (5.0, 5.0, 5.0)},
+           "action": 0.1, "retry": 1.0},
     "safe": {"step": 0.3, "profile_quiet": 0.6, "short_quiet": 0.2, "ok_quiet": 0.5, "poll": 0.05,
-             "action": 0.05, "retry": 0.5, "tab_tries": (1.5, 3.0, 5.0)},
+             "action": 0.05, "retry": 0.5},
     "fast": {"step": 0.1, "profile_quiet": 0.4, "short_quiet": 0.1, "ok_quiet": 0.3, "poll": 0.05,
-             "action": 0.05, "retry": 0.3, "tab_tries": (1.0, 2.5, 5.0)},
+             "action": 0.05, "retry": 0.3},
 }
 _PACE = SPEED_PROFILES[SPEED]
 STEP_DELAY_SECONDS = _PACE["step"]       # pause before every step (checks before/after a step are not shortened)
@@ -180,7 +181,7 @@ MAX_ATTEMPTS = 3             # tries of one action in total when its result is m
 RETRY_PAUSE_SECONDS = _PACE["retry"]     # between two tries
 QUIET_SHORT = _PACE["short_quiet"]       # PM must stay as it is after a field / a radio / Cancel / a tab close
 QUIET_AFTER_OK = _PACE["ok_quiet"]       # PM must stay idle after the final OK
-T_TAB_CLOSE_TRIES = _PACE["tab_tries"]   # wait after each close of a profile tab (3 tries)
+TAB_CLOSE_RESEND = 1.0      # a profile tab still open: ask PM again to close it this often (every pace)
 CONTROL_MODE = "background"   # "background": messages + UIA only; "mouse": physical clicks (v2)
 # Optional WM_COMMAND ids. When set, the command is posted to the PM main window
 # instead of using the Ribbon button / the Options menu.
@@ -220,6 +221,8 @@ T_VERIFY = 3
 T_UIA_INVOKE = 10          # UIA call may stay blocked while PM shows the dialog it opened
 T_UIA_READ = 4             # reading texts through UIA; never allowed to block a step
 T_TAB_CLOSE = 5
+T_TAB_CLOSE_LIMIT = 60     # PM ignores a tab close while the profile is busy (10/28: 2-17 s); then the run stops
+TAB_CLOSE_PICTURE_AFTER = 10   # one screenshot when a tab is still open after this long
 QUIET_SECONDS = _PACE["profile_quiet"]  # measured gap between System Messages and Player Comment: 0.04-0.25s
 SAME_PLAYER_WAIT_SECONDS = 8.0      # profile load measured 4.1-5.2s
 POLL = _PACE["poll"]
@@ -305,6 +308,9 @@ MAIN_CLASSES = {"XTPMainFrame"}
 MIN_POPUP_SIZE = 9          # XTP menu shadows are 4px wide windows
 IGNORED_CLASS_RE = re.compile(r"tooltip|shadow|PopupBubbleWnd|^IME$|MSCTFIME", re.I)
 LOGIN_BUTTON_NAMES = {"login", "log in", "logon", "log on", "sign in", "ok"}
+# PM refusing the logon (10/27): "The system could not log you on. Please make sure your password is correct."
+LOGON_REFUSED_RE = re.compile(r"could not log you on|make sure your password is correct|"
+                              r"password is (?:incorrect|invalid|wrong)|invalid (?:user ?name|password)", re.I)
 WM_MDIGETACTIVE = 0x0229
 BN_CLICKED = 0
 BS_TYPEMASK = 0x0F
@@ -1775,6 +1781,9 @@ class Win32PM:
                         key=lambda h: win32gui.GetWindowRect(h)[1])
         if not passwords or not others:
             raise StepError("0_login", "Could not identify separate Username and Password fields.")
+        if len(passwords) > 1:
+            raise StepError("0_login", f"The login window shows {len(passwords)} password fields; the runner does "
+                                       f"not guess which one to use. Log in to PM by hand, then run it again.")
         user_ctl, password_ctl = others[0], passwords[0]
         HwndWrapper(user_ctl).set_edit_text(username)
         HwndWrapper(password_ctl).set_edit_text(password)
@@ -2158,6 +2167,13 @@ def ensure_logged_in(pm, username, password):
     deadline = time.time() + T_LOGIN
     while True:
         state = read_state(pm)
+        refused = next((p for p in state.popups if p.kind == UNKNOWN
+                        and LOGON_REFUSED_RE.search(pm.describe(p.hwnd))), None)
+        if refused is not None:
+            raise StepError(step, f"PM refused the logon: {pm.describe(refused.hwnd)}. Check PM_USERNAME / "
+                                  f"PM_PASSWORD in pm_credentials.py (password changed or expired?), or log in to "
+                                  f"PM by hand and run the runner again (it starts from a logged-in PM). The runner "
+                                  f"does not try to log on again, so that the account is not locked.")
         raise_on_unknown(pm, step, state, "logging in")
         if (state.get(LOGIN) is None and not state.popups and state.main_enabled
                 and state.title.startswith("Patron Management - ")):
@@ -2415,7 +2431,7 @@ def open_profile(pm, job, progress):
     if open_tab and title_has_player(pm.window_title(open_tab), player_id):
         # Same player as the previous job: close its tab so Find opens a fresh profile.
         log(f"  [{step}] profile of {player_id} is still open, closing that tab first")
-        close_tab_until_gone(pm, step, open_tab, f"close the tab of {player_id}")
+        close_tab_until_gone(pm, step, open_tab, f"close the tab of {player_id}", player_id)
         state = wait_state(pm, step, popups=(), main_enabled=True, timeout=T_TAB_CLOSE, quiet=QUIET_SHORT,
                            what="PM idle after closing the tab")
     previous_title = state.title
@@ -2922,14 +2938,52 @@ def process_job(pm, job, progress, allow_ok=False):
         run_bbr(pm, job, progress, allow_ok)
 
 
-def close_tab_until_gone(pm, step, tab, what):
-    def close(attempt):
-        log(f"  [{step}] {what}")
-        pm.close_tab(tab)
+def close_tab_until_gone(pm, step, tab, what, player_id):
+    """Close a player's profile tab and wait until it is gone.
 
-    # PM often ignores the first close right after a coupon: try again soon, then wait longer.
-    attempt_until(pm, step, what, close, lambda: not pm.exists(tab) or not pm.visible(tab), T_TAB_CLOSE_TRIES,
-                  same_screen=screen_is((), main_enabled=True), target=tab)
+    PM ignores a close (it does not keep it for later) while the profile is still busy: loading,
+    or refreshing after an OK. In the run of 10/28 most tabs took the close 1-4 s after the OK;
+    one big profile took it after 11 s, and the next time not within 11 s (3 tries), which
+    stopped the run. So the close is sent again every TAB_CLOSE_RESEND seconds until the tab is
+    gone, for at most T_TAB_CLOSE_LIMIT seconds; then the run stops. When PM took a close on
+    10/28 the tab was gone within the same second, so a request 1 s later does not meet a tab
+    that is still closing. The close goes to this tab's own window only, and only while that
+    window still shows this player and PM's main window is enabled; any popup stops the run.
+    """
+    started = time.time()
+    sends, last_send, pictured = 0, None, False
+    log(f"  [{step}] {what}")
+    while True:
+        state = read_state(pm)
+        raise_on_unknown(pm, step, state, what)
+        if not pm.exists(tab) or not pm.visible(tab):
+            break
+        waited = time.time() - started
+        if state.popups:
+            raise StepError(step, f"{what}: PM shows {state.kinds()} while the tab is open, so the close is not "
+                                  f"asked again. State: {state.summary()}", tab)
+        if waited > T_TAB_CLOSE_LIMIT:
+            raise StepError(step, f"{what}: the tab is still open after {T_TAB_CLOSE_LIMIT}s and {sends} close "
+                                  f"request(s); tab title '{pm.window_title(tab)}'. State: {state.summary()}", tab)
+        if not pictured and waited >= TAB_CLOSE_PICTURE_AFTER:
+            pictured = True
+            log(f"  [{step}] {what}: still open after {waited:.0f}s (PM still busy?); asking again every "
+                f"{TAB_CLOSE_RESEND}s for up to {T_TAB_CLOSE_LIMIT}s")
+            save_screens(pm, step, f"{what}_still_open", tab)
+        due = last_send is None or time.time() - last_send >= TAB_CLOSE_RESEND
+        if due and state.main_enabled and title_has_player(pm.window_title(tab), player_id):
+            try:
+                pm.close_tab(tab)
+            except Exception as exc:        # e.g. the tab is being destroyed at this very moment
+                if pm.exists(tab):
+                    log(f"  [{step}] {what}: Windows reported an error ({type(exc).__name__}: {exc}); "
+                        f"asking again")
+            sends += 1
+            last_send = time.time()
+        time.sleep(POLL)
+    if sends > 1:
+        log(f"  [{step}] {what}: closed after {time.time() - started:.1f}s ({sends} close requests; PM ignores "
+            f"them while the profile is busy)")
 
 
 def close_job_tab(pm, progress, player_id):
@@ -2942,7 +2996,7 @@ def close_job_tab(pm, progress, player_id):
     title = pm.window_title(tab)
     if not title_has_player(title, player_id):
         raise StepError(step, f"tab #{tab} is '{title}', not player {player_id}; not closed.")
-    close_tab_until_gone(pm, step, tab, f"close the tab of {player_id}")
+    close_tab_until_gone(pm, step, tab, f"close the tab of {player_id}", player_id)
     wait_state(pm, step, popups=(), main_enabled=True, timeout=T_TAB_CLOSE, quiet=QUIET_SHORT,
                what="PM idle after closing the tab")
 
@@ -2959,7 +3013,7 @@ def close_profile_tabs(pm, tabs):
             log(f"  [{step}] skip tab #{tab}: title '{title}' is not player {player_id}")
             continue
         check_state(pm, step, popups=(), main_enabled=True)
-        close_tab_until_gone(pm, step, tab, f"close tab '{title}'")
+        close_tab_until_gone(pm, step, tab, f"close tab '{title}'", player_id)
         wait_state(pm, step, popups=(), main_enabled=True, timeout=T_TAB_CLOSE, quiet=QUIET_SHORT,
                    what="PM idle after closing the tab")
         closed += 1
