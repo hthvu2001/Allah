@@ -8,10 +8,20 @@ v5 changes only HOW LONG the runner waits, never WHAT it checks:
     0.5 -> 0.2 s, after OK 1.0 -> 0.5 s);
   - PM is polled every 0.05 s instead of 0.1 s, a new try comes 0.5 s after a missed one;
   - closing a profile tab: PM ignores a close while the profile is still busy (loading, or
-    refreshing after an OK); the close is asked again every 1 s until the tab is gone (at most
-    60 s), instead of 3 tries in about 10 s (5.2: the run of 10/28 stopped there after a DONE);
+    refreshing after an OK); the close is asked again until the tab is gone (at most 60 s):
+    after 2 s, 3 s, then every 5 s, and only while PM answers (5.2 / 5.3);
   - the end of the run shows the run time and the average time per player.
 Pick the pace with SPEED = "safe" (default), "fast" or "v4" below.
+
+5.3 - a slow PM (run of 11/05):
+  - PM not answering is never read as an answer: "BBR is no longer selected" came from PM being
+    busy for 2 s, not from BBR. Every read waits for PM's real answer, every step starts only
+    when PM answers, and an action is never repeated while PM has not answered;
+  - the longer a wait lasts, the less often PM is asked (every 0.05 s, then 0.1 / 0.25 / 0.5 s);
+  - PM_SLOW_SWITCH_SECONDS (30 s) without a response in one wait: the pace switches to "v4" and
+    the current step goes on; after PM_SMOOTH_PLAYERS (5) players in a row without that, it goes
+    back to SPEED (AUTO_PACE). No call to PM can hang the runner: after T_PM_ANSWER (90 s)
+    without an answer the run stops with a message (also while logging in).
 
 Same workflows as v4:
 
@@ -88,6 +98,7 @@ control IDs, never by screen coordinates.
 import csv
 import ctypes
 import os
+import queue
 import re
 import shutil
 import struct
@@ -113,7 +124,7 @@ try:
 except ImportError:  # lets the step logic be imported and tested off Windows
     win32con = win32gui = win32process = None
 
-RUNNER_VERSION = "5.2-time-saving"
+RUNNER_VERSION = "5.3-time-saving"
 BASE_DIR = Path(__file__).resolve().parent
 EXCEL_FILE = BASE_DIR / "Excel-for-auto.xlsx"
 LOG_FILE = BASE_DIR / "pm_automation_log.csv"
@@ -181,7 +192,13 @@ MAX_ATTEMPTS = 3             # tries of one action in total when its result is m
 RETRY_PAUSE_SECONDS = _PACE["retry"]     # between two tries
 QUIET_SHORT = _PACE["short_quiet"]       # PM must stay as it is after a field / a radio / Cancel / a tab close
 QUIET_AFTER_OK = _PACE["ok_quiet"]       # PM must stay idle after the final OK
-TAB_CLOSE_RESEND = 1.0      # a profile tab still open: ask PM again to close it this often (every pace)
+TAB_CLOSE_RESEND = (2.0, 3.0, 5.0)   # a tab still open: ask PM again after 2 s, 3 s, then every 5 s
+AUTO_PACE = True            # PM slow in one wait for PM_SLOW_SWITCH_SECONDS: use the "v4" pace for a while
+PM_SLOW_SWITCH_SECONDS = 30
+PM_SMOOTH_PLAYERS = 5       # back to SPEED after this many players in a row without PM being that slow
+T_PM_ANSWER = 90            # one call to PM without an answer this long: the run stops ("PM is not answering")
+PM_ANSWER_WITHIN = 0.25     # PM answers a no-op message within this: it is not busy
+T_PICTURE = 10              # a screenshot / the name colour: given up when PM does not draw within this
 CONTROL_MODE = "background"   # "background": messages + UIA only; "mouse": physical clicks (v2)
 # Optional WM_COMMAND ids. When set, the command is posted to the PM main window
 # instead of using the Ribbon button / the Options menu.
@@ -222,7 +239,6 @@ T_UIA_INVOKE = 10          # UIA call may stay blocked while PM shows the dialog
 T_UIA_READ = 4             # reading texts through UIA; never allowed to block a step
 T_TAB_CLOSE = 5
 T_TAB_CLOSE_LIMIT = 60     # PM ignores a tab close while the profile is busy (10/28: 2-17 s); then the run stops
-TAB_CLOSE_PICTURE_AFTER = 10   # one screenshot when a tab is still open after this long
 QUIET_SECONDS = _PACE["profile_quiet"]  # measured gap between System Messages and Player Comment: 0.04-0.25s
 SAME_PLAYER_WAIT_SECONDS = 8.0      # profile load measured 4.1-5.2s
 POLL = _PACE["poll"]
@@ -340,6 +356,136 @@ _main_done = threading.Event()
 def check_stop():
     if STOP["reason"]:
         raise RunStopped(STOP["reason"])
+
+
+# ------------------------------------------------------------------ slow PM (5.3)
+
+class PMNoAnswer(StepError):
+    """PM did not answer a call for T_PM_ANSWER seconds: the run stops (PM is left as it is)."""
+
+
+class PMTooSlow(Exception):
+    """An optional call (a screenshot, the name colour) given up because PM did not draw in time."""
+
+
+CURRENT = {"step": "start"}      # the step being run, for messages from inside a wait
+PACE = {"name": SPEED, "auto": False, "smooth": 0, "slow_now": False, "switches": 0}
+NO_ANSWER = object()             # PM did not answer a message in time (busy or hung): never a value
+GONE = object()                  # the window does not exist any more
+
+
+def set_pace(name):
+    """Use the waits of SPEED_PROFILES[name] from now on (the step being run goes on)."""
+    global STEP_DELAY_SECONDS, ACTION_PAUSE_SECONDS, RETRY_PAUSE_SECONDS, QUIET_SHORT, QUIET_AFTER_OK
+    global QUIET_SECONDS, POLL
+    pace = SPEED_PROFILES[name]
+    STEP_DELAY_SECONDS, ACTION_PAUSE_SECONDS, RETRY_PAUSE_SECONDS = pace["step"], pace["action"], pace["retry"]
+    QUIET_SHORT, QUIET_AFTER_OK, QUIET_SECONDS = pace["short_quiet"], pace["ok_quiet"], pace["profile_quiet"]
+    POLL = pace["poll"]
+    PACE["name"] = name
+
+
+def pm_was_slow(step, what, waited):
+    """One wait has had no response from PM for PM_SLOW_SWITCH_SECONDS: switch to the v4 pace."""
+    PACE["slow_now"] = True
+    if AUTO_PACE and PACE["name"] != "v4":
+        set_pace("v4")
+        PACE.update(auto=True, smooth=0, switches=PACE["switches"] + 1)
+        log(f"  [{step}] PM has not responded for {waited:.0f}s ({what}): switching to the v4 pace, the "
+            f"current step goes on. Back to '{SPEED}' after {PM_SMOOTH_PLAYERS} players in a row without this.")
+    else:
+        log(f"  [{step}] PM has not responded for {waited:.0f}s ({what}); still waiting")
+
+
+def pace_after_player():
+    """After each player: back to SPEED once the runner's v4 pace has seen PM_SMOOTH_PLAYERS players
+    in a row without PM being slow."""
+    if not PACE["auto"]:
+        return
+    PACE["smooth"] = 0 if PACE["slow_now"] else PACE["smooth"] + 1
+    if PACE["smooth"] >= PM_SMOOTH_PLAYERS:
+        set_pace(SPEED)
+        PACE.update(auto=False, smooth=0)
+        log(f"{PM_SMOOTH_PLAYERS} players in a row without PM being slow: back to the '{SPEED}' pace.")
+
+
+def poll_interval(waited):
+    """Time before PM is asked again: the longer a wait lasts, the less often PM is asked."""
+    if waited < 1.0:
+        return POLL
+    if waited < 3.0:
+        return max(POLL, 0.1)
+    if waited < 10.0:
+        return max(POLL, 0.25)
+    return max(POLL, 0.5)
+
+
+class Waiting:
+    """One wait for PM: asks less often as it grows, and notes once when PM has been slow."""
+
+    def __init__(self, step, what):
+        self.step, self.what = step, what
+        self.started = time.time()
+        self.slow_noted = False
+
+    def waited(self):
+        return time.time() - self.started
+
+    def note_if_slow(self):
+        waited = self.waited()
+        if not self.slow_noted and waited >= PM_SLOW_SWITCH_SECONDS:
+            self.slow_noted = True
+            pm_was_slow(self.step, self.what, waited)
+
+    def pause(self):
+        self.note_if_slow()
+        time.sleep(poll_interval(self.waited()))
+
+
+class PMCalls:
+    """Every call that needs an answer from PM's window thread runs in one worker thread, so the
+    runner never hangs on a busy or frozen PM: it waits (noting a slow PM), and after T_PM_ANSWER
+    seconds without an answer it stops with a message instead."""
+
+    def __init__(self):
+        self.jobs = queue.Queue()
+        self.thread = None
+        self.stuck = None            # what PM never answered
+
+    def _work(self):
+        while True:
+            fn, box, done = self.jobs.get()
+            try:
+                box["value"] = fn()
+            except BaseException as exc:      # handed back to the caller
+                box["error"] = exc
+            finally:
+                done.set()
+
+    def run(self, fn, what, waiting, give_up_after=None):
+        if self.stuck:
+            raise PMNoAnswer(CURRENT["step"], f"PM never answered ({self.stuck}), so nothing more is asked of "
+                                              f"it. PM is left as it is.")
+        if self.thread is None or not self.thread.is_alive():
+            self.thread = threading.Thread(target=self._work, name="pm-calls", daemon=True)
+            self.thread.start()
+        box, done = {}, threading.Event()
+        self.jobs.put((fn, box, done))
+        while not done.wait(0.2):
+            check_stop()
+            if give_up_after is not None and waiting.waited() > give_up_after:
+                raise PMTooSlow(f"PM did not answer within {give_up_after:.0f}s ({what})")
+            if waiting.waited() > T_PM_ANSWER:
+                self.stuck = what
+                raise PMNoAnswer(CURRENT["step"], f"PM has not answered for {T_PM_ANSWER}s ({what}). "
+                                                  f"PM is left as it is.")
+            waiting.note_if_slow()
+        if "error" in box:
+            raise box["error"]
+        return box.get("value")
+
+
+PM_CALLS = PMCalls()
 
 
 def install_close_handler():
@@ -573,8 +719,10 @@ def finish_run_files(kind):
             log(f"  {line}")
     if RUN_FILES.get("timing"):
         players, elapsed = RUN_FILES["timing"]
+        slow = (f"; PM was slow {PACE['switches']} time(s), the v4 pace was used for a while"
+                if PACE["switches"] else "")
         log(f"Run time {int(elapsed // 60)} min {int(elapsed % 60)} s for {players} row(s), "
-            f"{elapsed / players:.1f} s per row (pace '{SPEED}').")
+            f"{elapsed / players:.1f} s per row (pace '{SPEED}'{slow}).")
     if _app_timeout["count"]:
         log(f"PM 'Application Timeout' (logoff countdown) was closed {_app_timeout['count']} time(s) with Cancel.")
     if check and "plan" in RUN_FILES:
@@ -1343,19 +1491,72 @@ class Win32PM:
         visible = [h for h in found if win32gui.IsWindowVisible(h)]
         return (visible or found or [None])[0]
 
-    def text(self, hwnd):
-        try:
-            return handleprops.text(hwnd) or ""
-        except Exception:
-            return ""
+    # -- calls that need PM's answer: all run through PM_CALLS (never block the runner)
 
-    def checked(self, hwnd):
+    def responsive(self):
+        """PM's window thread answers a no-op message within PM_ANSWER_WITHIN seconds (it is not busy)."""
         try:
-            _, value = win32gui.SendMessageTimeout(
-                hwnd, win32con.BM_GETCHECK, 0, 0, win32con.SMTO_ABORTIFHUNG, 2000)
-            return value == win32con.BST_CHECKED
+            win32gui.SendMessageTimeout(self.main, win32con.WM_NULL, 0, 0, win32con.SMTO_ABORTIFHUNG,
+                                        int(PM_ANSWER_WITHIN * 1000))
+            return True
         except win32gui.error:
             return False
+
+    @staticmethod
+    def _message(hwnd, message, wparam=0, lparam=0, timeout_ms=1000):
+        """SendMessageTimeout: PM's answer, NO_ANSWER when PM did not answer in time, GONE without the window."""
+        try:
+            return win32gui.SendMessageTimeout(hwnd, message, wparam, lparam, win32con.SMTO_ABORTIFHUNG,
+                                               timeout_ms)[1]
+        except win32gui.error:
+            return NO_ANSWER if win32gui.IsWindow(hwnd) else GONE
+
+    def _ask(self, what, fn, again=None, hwnd=None, give_up_after=None):
+        """PM's answer to fn(), run in the PM-call worker. While again(answer) says PM did not answer
+        yet, PM is first waited for (a no-op message) and then asked again; a window that is gone
+        gives GONE. Nothing here ever turns "no answer" into a value."""
+        waiting = Waiting(CURRENT["step"], f"PM to answer: {what}")
+        while True:
+            answer = PM_CALLS.run(fn, what, waiting, give_up_after)
+            if again is None or not again(answer):
+                return answer
+            while True:
+                if hwnd is not None and not win32gui.IsWindow(hwnd):
+                    return GONE
+                if waiting.waited() > T_PM_ANSWER:
+                    PM_CALLS.stuck = what
+                    raise PMNoAnswer(CURRENT["step"], f"PM has not answered for {T_PM_ANSWER}s ({what}). "
+                                                      f"PM is left as it is.")
+                if give_up_after is not None and waiting.waited() > give_up_after:
+                    raise PMTooSlow(f"PM did not answer within {give_up_after:.0f}s ({what})")
+                check_stop()
+                waiting.pause()
+                if self.responsive():
+                    break
+
+    def text(self, hwnd):
+        """Text of a control. PM busy (no answer within 0.5 s): asked again, never read as an empty text."""
+        if not hwnd or not win32gui.IsWindow(hwnd):
+            return ""
+
+        def read():
+            try:
+                value = handleprops.text(hwnd)
+            except Exception:
+                return ""                     # as before: an unreadable text counts as empty
+            if value is None:                 # WM_GETTEXTLENGTH not answered within 0.5 s
+                return NO_ANSWER if win32gui.IsWindow(hwnd) else GONE
+            return value
+
+        value = self._ask(f"the text of control #{hwnd}", read, again=lambda v: v is NO_ANSWER, hwnd=hwnd)
+        return value if isinstance(value, str) else ""
+
+    def checked(self, hwnd):
+        """Radio / check box state. PM busy: asked again - "no answer" is never read as "not selected"."""
+        value = self._ask(f"whether control #{hwnd} is selected",
+                          lambda: self._message(hwnd, win32con.BM_GETCHECK),
+                          again=lambda v: v is NO_ANSWER, hwnd=hwnd)
+        return value == win32con.BST_CHECKED
 
     def _top(self, hwnd):
         return int(self._user32.GetAncestor(hwnd, 2) or hwnd)
@@ -1415,8 +1616,11 @@ class Win32PM:
                 and self._style(h) & BS_TYPEMASK in RADIO_STYLES]
 
     def _send(self, hwnd, message, wparam=0, lparam=0):
-        return win32gui.SendMessageTimeout(hwnd, message, wparam, lparam,
-                                           win32con.SMTO_ABORTIFHUNG, 3000)[1]
+        """A message PM must answer (BM_SETCHECK, WM_NEXTDLGCTL); a busy PM is waited for, then asked again."""
+        value = self._ask(f"message {message:#06x} to control #{hwnd}",
+                          lambda: self._message(hwnd, message, wparam, lparam, timeout_ms=3000),
+                          again=lambda v: v is NO_ANSWER, hwnd=hwnd)
+        return 0 if value is GONE else value
 
     def click(self, hwnd):
         """Background: tell the dialog the button was clicked (WM_COMMAND/BN_CLICKED).
@@ -1447,7 +1651,8 @@ class Win32PM:
         time.sleep(ACTION_PAUSE_SECONDS)
 
     def set_text(self, hwnd, value):
-        HwndWrapper(hwnd).set_edit_text(str(value))    # EM_SETSEL + EM_REPLACESEL, no focus
+        # EM_SETSEL + EM_REPLACESEL, no focus; waits for PM in the PM-call worker
+        self._ask(f"writing into control #{hwnd}", lambda: HwndWrapper(hwnd).set_edit_text(str(value)))
 
     def type_text(self, hwnd, value):
         if background_mode():
@@ -1470,12 +1675,16 @@ class Win32PM:
         No WM_NOTIFY is sent to the dialog: Windows refuses WM_NOTIFY between processes
         ("Access is denied"). The dialog reads the value from the picker when OK is clicked.
         """
-        HwndWrapper(hwnd).set_time(year=value.year, month=value.month, day_of_week=value.isoweekday() % 7,
-                                   day=value.day, hour=value.hour, minute=value.minute)
+        self._ask(f"setting the date of control #{hwnd}", lambda: HwndWrapper(hwnd).set_time(
+            year=value.year, month=value.month, day_of_week=value.isoweekday() % 7,
+            day=value.day, hour=value.hour, minute=value.minute))
 
     def date_get(self, hwnd):
-        st = HwndWrapper(hwnd).get_time()
-        return datetime(st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute)
+        def read():
+            st = HwndWrapper(hwnd).get_time()
+            return datetime(st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute)
+
+        return self._ask(f"the date of control #{hwnd}", read)
 
     def _uia_read(self, read, what, timeout=T_UIA_READ):
         """Run a UIA read in a worker thread; give up after `timeout` instead of blocking the run.
@@ -1513,6 +1722,11 @@ class Win32PM:
         return items or []
 
     def _capture(self, window):
+        """_capture_now in the PM-call worker: given up (PMTooSlow) when PM does not draw within T_PICTURE."""
+        return self._ask(f"a picture of window #{window}", lambda: self._capture_now(window),
+                         give_up_after=T_PICTURE)
+
+    def _capture_now(self, window):
         """PM's own rendering of a top-level window (PrintWindow: no focus, works when covered).
 
         Returns (width, height, BGRA rows top-down, screen left, screen top).
@@ -1570,17 +1784,23 @@ class Win32PM:
         return width, height, raw, box
 
     def combo_items(self, hwnd):
-        return list(HwndWrapper(hwnd).item_texts())
+        return self._ask(f"the items of list #{hwnd}", lambda: list(HwndWrapper(hwnd).item_texts()))
 
     def combo_select(self, hwnd, text):
-        combo = HwndWrapper(hwnd)
-        combo.select(combo.item_texts().index(text))   # exact match, never fuzzy
+        def select():
+            combo = HwndWrapper(hwnd)
+            combo.select(combo.item_texts().index(text))   # exact match, never fuzzy
+
+        self._ask(f"selecting '{text}' in list #{hwnd}", select)
 
     def combo_selected(self, hwnd):
-        combo = HwndWrapper(hwnd)
-        index = combo.selected_index()
-        items = combo.item_texts()
-        return items[index] if 0 <= index < len(items) else ""
+        def read():
+            combo = HwndWrapper(hwnd)
+            index = combo.selected_index()
+            items = combo.item_texts()
+            return items[index] if 0 <= index < len(items) else ""
+
+        return self._ask(f"the selected item of list #{hwnd}", read)
 
     def describe(self, hwnd):
         texts = []
@@ -1705,12 +1925,9 @@ class Win32PM:
         client = win32gui.FindWindowEx(self.main, 0, "MDIClient", None)
         if not client:
             return 0
-        try:
-            _, active = win32gui.SendMessageTimeout(
-                client, WM_MDIGETACTIVE, 0, 0, win32con.SMTO_ABORTIFHUNG, 2000)
-            return int(active or 0)
-        except win32gui.error:
-            return 0
+        active = self._ask("the active profile tab", lambda: self._message(client, WM_MDIGETACTIVE, timeout_ms=2000),
+                           again=lambda v: v is NO_ANSWER, hwnd=client)
+        return int(active) if isinstance(active, int) else 0
 
     def close_tab(self, hwnd):
         win32gui.PostMessage(hwnd, win32con.WM_SYSCOMMAND, win32con.SC_CLOSE, 0)
@@ -1785,8 +2002,9 @@ class Win32PM:
             raise StepError("0_login", f"The login window shows {len(passwords)} password fields; the runner does "
                                        f"not guess which one to use. Log in to PM by hand, then run it again.")
         user_ctl, password_ctl = others[0], passwords[0]
-        HwndWrapper(user_ctl).set_edit_text(username)
-        HwndWrapper(password_ctl).set_edit_text(password)
+        self._ask("typing the username into the login window", lambda: HwndWrapper(user_ctl).set_edit_text(username))
+        self._ask("typing the password into the login window",
+                  lambda: HwndWrapper(password_ctl).set_edit_text(password))
         if self.text(user_ctl).strip() != username.strip():
             raise StepError("0_login", "Username field does not show the configured username.")
         for name in ("Login", "Log In", "Logon", "Log On", "Sign In", "OK"):
@@ -1865,8 +2083,35 @@ def raise_on_unknown(pm, step, state, while_doing):
         raise StepError(step, f"unexpected popup while {while_doing}: {pm.describe(unknown[0].hwnd)}")
 
 
+def pm_answering(pm):
+    responsive = getattr(pm, "responsive", None)
+    return responsive is None or responsive()
+
+
+def wait_until_answering(pm, step, what):
+    """Wait while PM's window thread does not answer (busy); True when it had to wait.
+
+    A busy PM would only queue what the runner sends next. Nothing but a no-op message is sent here.
+    """
+    if pm_answering(pm):
+        return False
+    waiting = Waiting(step, f"PM to answer before {what}")
+    noted = False
+    while not pm_answering(pm):
+        if waiting.waited() > T_PM_ANSWER:
+            raise PMNoAnswer(step, f"PM has not answered for {T_PM_ANSWER}s (before {what}). PM is left as it is.")
+        if not noted and waiting.waited() >= 2.0:
+            noted = True
+            log(f"  [{step}] PM is busy (not answering): waiting before {what}")
+        waiting.pause()
+    if noted:
+        log(f"  [{step}] PM answers again after {waiting.waited():.1f}s")
+    return True
+
+
 def check_state(pm, step, popups=(), main_enabled=None, player_id=None):
-    """Pre-check: PM must already be in this state, otherwise stop."""
+    """Pre-check: PM must already be in this state, otherwise stop. A busy PM is waited for first."""
+    wait_until_answering(pm, step, "this step")
     state = read_state(pm)
     raise_on_unknown(pm, step, state, "checking the state before this step")
     problem = state_problem(state, popups, main_enabled, player_id)
@@ -1879,6 +2124,7 @@ def check_state(pm, step, popups=(), main_enabled=None, player_id=None):
 def wait_state(pm, step, popups=(), main_enabled=None, player_id=None,
                timeout=T_VERIFY, quiet=0.0, what="the expected state", fail=True):
     """Post-check: wait until PM reaches this state (stable for `quiet` seconds)."""
+    waiting = Waiting(step, what)
     deadline = time.time() + timeout
     stable_since = None
     problem = "not checked yet"
@@ -1898,22 +2144,27 @@ def wait_state(pm, step, popups=(), main_enabled=None, player_id=None,
                 return None
             raise StepError(step, f"timed out after {timeout}s waiting for {what}: {problem}. "
                                   f"State: {state.summary()}")
-        time.sleep(POLL)
+        waiting.pause()
 
 
-def wait_until(predicate, timeout, interval=POLL):
+def wait_until(predicate, timeout, interval=None):
+    """predicate() true within `timeout` (PM asked less often as the wait grows)."""
+    waiting = Waiting(CURRENT["step"], "a control to be ready")
     deadline = time.time() + timeout
     while True:
         try:
             if predicate():
                 return True
-        except RunStopped:
+        except (RunStopped, PMNoAnswer):
             raise
         except Exception:
             pass
         if time.time() > deadline:
             return False
-        time.sleep(interval)
+        if interval:
+            time.sleep(interval)
+        else:
+            waiting.pause()
 
 
 def state_if(pm, popups=(), main_enabled=None, player_id=None):
@@ -1996,14 +2247,22 @@ def attempt_until(pm, step, what, action, done, timeout, same_screen=None, descr
 
     At most MAX_ATTEMPTS tries in total. Before a new try PM must still show the screen the
     action was made for (`same_screen(state)`); any other screen or an unknown popup stops the run.
+    A new try is never sent while PM is busy (not answering): what was sent before may still be
+    waiting in PM, so once PM answers again it first gets the same time to show the result.
     An error reported by Windows while sending the action does not stop the run by itself: the
     result is read back from the control, and only a missing result counts as a failed try.
     Each failed try saves a screenshot of `target` (the control) and its window.
     """
     errors = {}
+    wait = timeout[0] if isinstance(timeout, (tuple, list)) else timeout
     for attempt in range(1, MAX_ATTEMPTS + 1):
         if attempt > 1:
             time.sleep(RETRY_PAUSE_SECONDS)
+            if wait_until_answering(pm, step, f"trying '{what}' again"):
+                result = wait_for_done(pm, step, what, done, wait, errors)
+                if result:
+                    log(f"  [{step}] {what}: done once PM answered again (no new try needed)")
+                    return result
             state = read_state(pm)
             raise_on_unknown(pm, step, state, what)
             result = _safe_done(done, errors)
@@ -2017,27 +2276,35 @@ def attempt_until(pm, step, what, action, done, timeout, same_screen=None, descr
             log(f"  [{step}] {what}: not done yet, trying again (try {attempt}/{MAX_ATTEMPTS})")
         try:
             action(attempt)
-        except StepError:
+        except (StepError, RunStopped):
             raise
         except Exception as exc:
             errors["send"] = f"{type(exc).__name__}: {exc}"
             log(f"  [{step}] {what}: Windows reported an error ({errors['send']}); "
                 f"checking the control to see whether it took effect")
         wait = timeout[min(attempt, len(timeout)) - 1] if isinstance(timeout, (tuple, list)) else timeout
-        deadline = time.time() + wait
-        while True:
-            state = read_state(pm)
-            raise_on_unknown(pm, step, state, what)
-            result = _safe_done(done, errors)
-            if result:
-                if attempt > 1 or "send" in errors:
-                    log(f"  [{step}] {what}: done on try {attempt} (checked on the control)")
-                return result
-            if time.time() > deadline:
-                break
-            time.sleep(POLL)
+        result = wait_for_done(pm, step, what, done, wait, errors)
+        if result:
+            if attempt > 1 or "send" in errors:
+                log(f"  [{step}] {what}: done on try {attempt} (checked on the control)")
+            return result
     raise StepError(step, f"{what}: still not done after {MAX_ATTEMPTS} tries"
                           f"{_details(describe)}{_errors(errors)}. State: {read_state(pm).summary()}", target)
+
+
+def wait_for_done(pm, step, what, done, seconds, errors):
+    """done() within `seconds` (PM asked less often as the wait grows); an unknown popup stops the run."""
+    waiting = Waiting(step, what)
+    deadline = time.time() + seconds
+    while True:
+        state = read_state(pm)
+        raise_on_unknown(pm, step, state, what)
+        result = _safe_done(done, errors)
+        if result:
+            return result
+        if time.time() > deadline:
+            return None
+        waiting.pause()
 
 
 def _errors(errors):
@@ -2081,13 +2348,14 @@ def close_popup(pm, step, popup, control_id, what, expect, timeout=None):
 
 
 def wait_popup_closed(pm, step, popup, timeout=T_POPUP_CLOSE):
+    waiting = Waiting(step, f"{popup.kind} to close")
     deadline = time.time() + timeout
     while pm.visible(popup.hwnd):
         state = read_state(pm)
         raise_on_unknown(pm, step, state, f"waiting for {popup.kind} to close")
         if time.time() > deadline:
             raise StepError(step, f"{popup.label()} did not close within {timeout}s. State: {state.summary()}")
-        time.sleep(POLL)
+        waiting.pause()
     log(f"  [{step}] {popup.kind} closed")
 
 
@@ -2164,6 +2432,8 @@ def ensure_logged_in(pm, username, password):
     login_window = check_state(pm, step, popups=(LOGIN,)).get(LOGIN)
     log(f"  [{step}] typing credentials into {login_window.label()}")
     pm.fill_login(login_window.hwnd, username, password)
+    log(f"  [{step}] credentials typed and Login clicked; waiting for PM to log in (up to {T_LOGIN}s)")
+    waiting = Waiting(step, "PM to log in")
     deadline = time.time() + T_LOGIN
     while True:
         state = read_state(pm)
@@ -2179,8 +2449,9 @@ def ensure_logged_in(pm, username, password):
                 and state.title.startswith("Patron Management - ")):
             break
         if time.time() > deadline:
-            raise StepError(step, f"login did not finish within {T_LOGIN}s. State: {state.summary()}")
-        time.sleep(POLL)
+            raise StepError(step, f"login did not finish within {T_LOGIN}s. Log in to PM by hand and run "
+                                  f"the runner again. State: {state.summary()}")
+        waiting.pause()
     wait_state(pm, step, popups=(), main_enabled=True, quiet=QUIET_SECONDS, timeout=10,
                what="PM idle after login")
     log("Login completed.")
@@ -2219,6 +2490,7 @@ def wait_profile_title(pm, step, player_id, previous_title, previous_tab):
     wait for a new profile tab, or SAME_PLAYER_WAIT_SECONDS if PM reuses the tab.
     """
     started = time.time()
+    waiting = Waiting(step, "the profile to load")
     deadline = started + T_PROFILE_LOAD
     same_player = title_has_player(previous_title, player_id)
     while True:
@@ -2241,7 +2513,7 @@ def wait_profile_title(pm, step, player_id, previous_title, previous_tab):
         if time.time() > deadline:
             raise StepError(step, f"profile {player_id} did not load within {T_PROFILE_LOAD}s. "
                                   f"State: {state.summary()}")
-        time.sleep(POLL)
+        waiting.pause()
 
 
 def summarize_messages(items):
@@ -2310,6 +2582,7 @@ def handle_player_comment(pm, step, popup):
 
 def settle_profile(pm, step, player_id, quiet):
     """Handle System Messages / Player Comment until PM stays idle for `quiet` seconds."""
+    waiting = Waiting(step, "the profile popups to finish")
     deadline = time.time() + T_PROFILE_POPUPS
     quiet_since = None
     messages, codes, pages = [], [], 0
@@ -2339,7 +2612,7 @@ def settle_profile(pm, step, player_id, quiet):
         if time.time() > deadline:
             raise StepError(step, f"profile did not become idle within {T_PROFILE_POPUPS}s. "
                                   f"State: {state.summary()}")
-        time.sleep(POLL)
+        waiting.pause()
 
 
 def read_identification(pm, step, tab):
@@ -2416,6 +2689,7 @@ def begin_step(progress, name):
     time.sleep(STEP_DELAY_SECONDS)
     check_stop()
     progress["step"] = name
+    CURRENT["step"] = name
     return name
 
 
@@ -2534,6 +2808,7 @@ def finish_coupon_ok(pm, step, job, progress, coupon):
     ledger_append(job, "OK_CLICKED")
     progress["ok_clicked"] = True
     click(pm, step, coupon, ID_OK, "Coupon Redemption OK", allow_ok=True, expect="OK")
+    waiting = Waiting(step, "the coupon confirmation")
     deadline = time.time() + T_AFTER_OK
     while True:
         state = read_state(pm)
@@ -2547,7 +2822,7 @@ def finish_coupon_ok(pm, step, job, progress, coupon):
         if time.time() > deadline:
             raise StepError(step, f"no confirmation {T_AFTER_OK}s after OK and Coupon Redemption is still open. "
                                   f"State: {state.summary()}", coupon.hwnd)
-        time.sleep(POLL)
+        waiting.pause()
     if confirm is None:
         progress["confirmation_check"] = "no confirmation was shown"
         log(f"  [{step}] NOTE: Coupon Redemption closed without the usual confirmation")
@@ -2569,6 +2844,7 @@ def finish_coupon_ok(pm, step, job, progress, coupon):
         ledger_append(job, "CONFIRM_CLICKED")
         # Clicked exactly once, like the first OK.
         click(pm, step, confirm, ID_OK, "confirmation OK", allow_ok=True, expect="OK")
+        waiting = Waiting(step, "the confirmation to close")
         deadline = time.time() + T_AFTER_OK
         while True:
             state = read_state(pm)
@@ -2582,7 +2858,7 @@ def finish_coupon_ok(pm, step, job, progress, coupon):
             if time.time() > deadline:
                 raise StepError(step, f"{confirm.label()} did not close within {T_AFTER_OK}s. "
                                       f"State: {state.summary()}", confirm.hwnd)
-            time.sleep(POLL)
+            waiting.pause()
     wait_state(pm, step, popups=(), main_enabled=True, player_id=player_id,
                timeout=T_AFTER_OK, quiet=QUIET_AFTER_OK, what="PM idle after the redemption")
     ledger_append(job, "DONE")
@@ -2816,7 +3092,19 @@ def run_adjust(pm, job, progress, allow_ok, bucket, reason, expires, comment):
     step = begin_step(progress, "8_open_adjustment")
     check_state(pm, step, popups=(), main_enabled=True, player_id=player_id)
     if not pm.checked(radio):
-        raise StepError(step, f"{bucket} is no longer selected.")
+        # PM's own answer (a busy PM is waited for, never read as "not selected"): PM really cleared
+        # it, e.g. while a big profile finished loading. Selecting it again is harmless; the header
+        # of the dialog that opens is checked anyway.
+        log(f"  [{step}] {bucket} is not selected any more (PM cleared it): selecting it again")
+        attempt_until(pm, step, f"select {bucket} again", select_radio,
+                      lambda: pm.checked(radio) and pm.enabled(adjust), T_VERIFY,
+                      same_screen=screen_is((), main_enabled=True),
+                      describe=lambda: f"{bucket} selected={pm.checked(radio)}, Adjust enabled={pm.enabled(adjust)}",
+                      target=radio)
+        wait_state(pm, step, popups=(), main_enabled=True, player_id=player_id, quiet=QUIET_SHORT,
+                   what=f"PM idle with {bucket} selected again")
+        if not pm.checked(radio):
+            raise StepError(step, f"{bucket} does not stay selected (PM clears it again). Nothing was opened.")
 
     def press_adjust(attempt):
         log(f"  [{step}] click Adjust (id={ADJUST_BUTTON})")
@@ -2942,47 +3230,40 @@ def close_tab_until_gone(pm, step, tab, what, player_id):
     """Close a player's profile tab and wait until it is gone.
 
     PM ignores a close (it does not keep it for later) while the profile is still busy: loading,
-    or refreshing after an OK. In the run of 10/28 most tabs took the close 1-4 s after the OK;
-    one big profile took it after 11 s, and the next time not within 11 s (3 tries), which
-    stopped the run. So the close is sent again every TAB_CLOSE_RESEND seconds until the tab is
-    gone, for at most T_TAB_CLOSE_LIMIT seconds; then the run stops. When PM took a close on
-    10/28 the tab was gone within the same second, so a request 1 s later does not meet a tab
-    that is still closing. The close goes to this tab's own window only, and only while that
-    window still shows this player and PM's main window is enabled; any popup stops the run.
+    or refreshing after an OK (10/28: 1-4 s after the OK, a big profile 11 s and more; 11/05: 8-13 s).
+    So the close is asked again until the tab is gone, for at most T_TAB_CLOSE_LIMIT seconds (then
+    the run stops): after TAB_CLOSE_RESEND seconds (2 s, 3 s, then every 5 s, asking PM less as
+    it gets slower), and only while PM answers - a busy PM would only queue it. The close goes
+    to this tab's own window only, and only while that window still shows this player and PM's
+    main window is enabled; any popup stops the run. No picture is taken while waiting.
     """
-    started = time.time()
-    sends, last_send, pictured = 0, None, False
+    waiting = Waiting(step, what)
+    sends, next_send = 0, 0.0
     log(f"  [{step}] {what}")
     while True:
         state = read_state(pm)
         raise_on_unknown(pm, step, state, what)
         if not pm.exists(tab) or not pm.visible(tab):
             break
-        waited = time.time() - started
         if state.popups:
             raise StepError(step, f"{what}: PM shows {state.kinds()} while the tab is open, so the close is not "
                                   f"asked again. State: {state.summary()}", tab)
-        if waited > T_TAB_CLOSE_LIMIT:
+        if waiting.waited() > T_TAB_CLOSE_LIMIT:
             raise StepError(step, f"{what}: the tab is still open after {T_TAB_CLOSE_LIMIT}s and {sends} close "
                                   f"request(s); tab title '{pm.window_title(tab)}'. State: {state.summary()}", tab)
-        if not pictured and waited >= TAB_CLOSE_PICTURE_AFTER:
-            pictured = True
-            log(f"  [{step}] {what}: still open after {waited:.0f}s (PM still busy?); asking again every "
-                f"{TAB_CLOSE_RESEND}s for up to {T_TAB_CLOSE_LIMIT}s")
-            save_screens(pm, step, f"{what}_still_open", tab)
-        due = last_send is None or time.time() - last_send >= TAB_CLOSE_RESEND
-        if due and state.main_enabled and title_has_player(pm.window_title(tab), player_id):
+        if time.time() >= next_send and state.main_enabled and pm_answering(pm) \
+                and title_has_player(pm.window_title(tab), player_id):
             try:
                 pm.close_tab(tab)
             except Exception as exc:        # e.g. the tab is being destroyed at this very moment
                 if pm.exists(tab):
                     log(f"  [{step}] {what}: Windows reported an error ({type(exc).__name__}: {exc}); "
-                        f"asking again")
+                        f"asking again later")
             sends += 1
-            last_send = time.time()
-        time.sleep(POLL)
+            next_send = time.time() + TAB_CLOSE_RESEND[min(sends, len(TAB_CLOSE_RESEND)) - 1]
+        waiting.pause()
     if sends > 1:
-        log(f"  [{step}] {what}: closed after {time.time() - started:.1f}s ({sends} close requests; PM ignores "
+        log(f"  [{step}] {what}: closed after {waiting.waited():.1f}s ({sends} close requests; PM ignores "
             f"them while the profile is busy)")
 
 
@@ -3167,6 +3448,9 @@ def run(pm, jobs, username, password, allow_ok=False, today=None):
     RUN_FILES["loc"] = []            # SKIPPED_LOC rows, to be done by hand
     RUN_FILES.pop("stopped_at", None)
     tabs = []
+    PM_CALLS.stuck = None
+    set_pace(SPEED)
+    PACE.update(auto=False, smooth=0, slow_now=False, switches=0)
     try:
         ensure_logged_in(pm, username, password)
     except Exception as exc:
@@ -3178,6 +3462,7 @@ def run(pm, jobs, username, password, allow_ok=False, today=None):
     for index, job in enumerate(jobs, start=1):
         started = time.time()
         progress = {"step": "1_precheck_idle", "today": today, "index": index}
+        PACE["slow_now"] = False
         RUN_FILES["current"] = (job, progress)
         request_check_update()
         wf = WORKFLOWS[job["workflow"]]
@@ -3266,6 +3551,7 @@ def run(pm, jobs, username, password, allow_ok=False, today=None):
                 note_problem(f"#{index} player {job['player_id']}: closing the profile tab failed: {exc}")
                 save_screens(pm, step, "stopped", getattr(exc, "hwnd", None), everything=True)
                 return 1
+        pace_after_player()
 
     if CLOSE_TABS_AT_END:
         try:
@@ -3330,8 +3616,10 @@ def main():
 
 def run_main(username, password):
     today = date.today()
+    auto = (f"; v4 pace when PM does not respond for {PM_SLOW_SWITCH_SECONDS}s"
+            if AUTO_PACE and SPEED != "v4" else "")
     log(f"Runner {RUNNER_VERSION}, control mode: {CONTROL_MODE}, pace '{SPEED}' "
-        f"(pause {STEP_DELAY_SECONDS}s per step, PM polled every {POLL}s)")
+        f"(pause {STEP_DELAY_SECONDS}s per step, PM polled every {POLL}s{auto})")
     log(f"Log folder: {RUN_FILES.get('dir', BASE_DIR)}")
     jobs, notes, violations = read_plan(today)
     RUN_FILES["plan"] = (jobs, notes, violations)
